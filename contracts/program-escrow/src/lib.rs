@@ -218,6 +218,7 @@ pub const DELEGATE_PERMISSION_MASK: u32 =
 // Role management constants for deterministic behavior
 pub const ROLE_MANAGEMENT_SCHEMA_VERSION_V1: u32 = 1;
 pub const MAX_ROLE_TRANSITION_PERIOD: u64 = 30 * 24 * 60 * 60; // 30 days in seconds
+pub const PAUSE_REASON_MAX_LEN: u32 = 256;
 
 /// Deterministic role transition state for upgrade-safe storage.
 #[contracttype]
@@ -728,11 +729,7 @@ pub struct ProgramData {
     /// Optional per-program circuit breaker failure threshold.
     /// If set, overrides the global default (3) for this program.
     /// Must be between 1 and 100 inclusive when set.
-    pub circuit_breaker_threshold: Option<u8>,
-    /// Optional fee-on-transfer router configuration.
-    /// When set, payouts query the router to compute gross amounts that
-    /// preserve the intended net payout after FoT deductions.
-    pub fot_router: Option<FotRouter>,
+    pub circuit_breaker_threshold: Option<u32>,
 }
 
 /// Program delegate audit record used for bulk reporting and indexer views.
@@ -899,9 +896,9 @@ pub struct CircuitBreakerThresholdSetEvent {
     /// Program the threshold applies to.
     pub program_id: String,
     /// Previous threshold value (None = not set, uses global default of 3).
-    pub previous_threshold: Option<u8>,
+    pub previous_threshold: Option<u32>,
     /// New threshold value (None = reset to global default of 3).
-    pub new_threshold: Option<u8>,
+    pub new_threshold: Option<u32>,
     /// Admin that made the change.
     pub set_by: Address,
     /// Ledger timestamp.
@@ -1062,7 +1059,7 @@ const IDEMPOTENCY_KEY_USED: Symbol = symbol_short!("IdempUsed");
 /// Keys must be between 1 and 256 bytes long.
 fn validate_idempotency_key(key: &str) -> Result<(), BatchError> {
     let key_len = key.len();
-    if key_len < MIN_IDEMPOTENCY_KEY_LENGTH || key_len > MAX_IDEMPOTENCY_KEY_LENGTH {
+    if key_len < MIN_IDEMPOTENCY_KEY_LENGTH as usize || key_len > MAX_IDEMPOTENCY_KEY_LENGTH as usize {
         return Err(BatchError::IdempotencyKeyInvalid);
     }
 
@@ -1084,7 +1081,7 @@ fn validate_idempotency_key(key: &str) -> Result<(), BatchError> {
     Ok(())
 }
 
-const ROLE_MANAGEMENT_SCHEMA: Symbol = symbol_short!("RoleMgmtSch");
+const ROLE_MANAGEMENT_SCHEMA: Symbol = symbol_short!("RoleMgmt");
 
 // Event symbol for per-window program spend limit enforcement
 const PROG_SPEND_LIMIT: Symbol = symbol_short!("prg_lim");
@@ -1273,6 +1270,8 @@ pub enum DataKey {
     SpendLimitSchemaVersion,
     PauseSchemaVersion,
     TokenAllowlist,
+    TokenAllowlistV2,
+    TokenDecimals(Address),
     TokenAllowlistSchemaVersion,
     SpendingConfig(String),
     SpendingState(String),
@@ -1673,9 +1672,10 @@ pub enum BatchError {
     IdempotencyKeyInvalid = 416,
     InvalidMerkleRoot = 409,
     BatchReceiptNotFound = 414,
-    InvalidPaginationLimit = 415,
+    InvalidPaginationLimit = 411,
     PaginationLimitExceeded = 412,
     InvalidPaginationOffset = 413,
+    BatchTooLarge = 410,
 }
 
 pub const MAX_BATCH_SIZE: u32 = 100;
@@ -1902,7 +1902,7 @@ impl ProgramEscrowContract {
         }
 
         // Validate schema version for upgrade safety
-        Self::validate_pagination_schema(env).map_err(|_| Error::InvalidPaginationOffset)?;
+        Self::validate_pagination_schema(env)?;
 
         let cfg = Self::get_history_pagination_config(env);
         if limit > cfg.max_limit {
@@ -1950,40 +1950,7 @@ impl ProgramEscrowContract {
         Ok(results)
     }
 
-    /// Admin-only immediate circuit breaker reset.
-    ///
-    /// Resets the circuit breaker to the `Closed` state and clears the
-    /// failure counters. This is an immediate/hard reset intended for use
-    /// by the contract admin after an incident has been resolved.
-    ///
-    /// Security: caller must be the contract admin (reads `DataKey::Admin` and
-    /// requires that address to sign the transaction). Emits an audit event
-    /// `(circuit, admin_reset)` with `(program_id, admin, timestamp)`.
-    pub fn reset_circuit_breaker(env: Env, program_id: String) -> Result<(), Error> {
-        // Read admin from instance storage and require its auth
-        let admin: Address = env
-            .storage()
-            .instance()
-            .get(&DataKey::Admin)
-            .map_err(|_| Error::Unauthorized)?;
-        admin.require_auth();
 
-        // Close circuit and clear counters (close_circuit resets counts and opened_at)
-        crate::error_recovery::close_circuit(&env);
-
-        // Ensure failure count is cleared as well (defensive)
-        env.storage()
-            .persistent()
-            .set(&crate::error_recovery::CircuitBreakerKey::FailureCount, &0u32);
-
-        // Emit admin reset audit event with program context
-        env.events().publish(
-            (symbol_short!("circuit"), symbol_short!("admin_reset")),
-            (program_id, admin, env.ledger().timestamp()),
-        );
-
-        Ok(())
-    }
 
     fn order_batch_lock_items(env: &Env, items: &Vec<LockItem>) -> soroban_sdk::Vec<LockItem> {
         let mut ordered: soroban_sdk::Vec<LockItem> = Vec::new(env);
@@ -2051,10 +2018,7 @@ impl ProgramEscrowContract {
 
     /// Validate idempotency key format and constraints
     fn validate_idempotency_key(idempotency_key: &String) {
-        let key_str = idempotency_key.as_str();
-        if validate_idempotency_key(key_str).is_err() {
-            panic!("IdempotencyKeyInvalid");
-        }
+        Self::validate_idempotency_key_format(idempotency_key);
     }
 
     /// Check if an idempotency key has been used before
@@ -3028,13 +2992,13 @@ impl ProgramEscrowContract {
 
         if let Some(r) = lock_fee_rate {
             if r > MAX_FEE_RATE {
-                panic_with_error!(&env, ContractError::InvalidFeeRate);
+                panic_with_error!(&env, &ContractError::InvalidFeeRate);
             }
             cfg.lock_fee_rate = r;
         }
         if let Some(r) = payout_fee_rate {
             if r > MAX_FEE_RATE {
-                panic_with_error!(&env, ContractError::InvalidFeeRate);
+                panic_with_error!(&env, &ContractError::InvalidFeeRate);
             }
             cfg.payout_fee_rate = r;
         }
@@ -3495,7 +3459,7 @@ impl ProgramEscrowContract {
     fn generate_rotation_nonce(env: &Env, proposer: &Address) -> u64 {
         // Use combination of timestamp, proposer address, and ledger sequence for deterministic nonce
         let timestamp = env.ledger().timestamp();
-        let sequence = env.ledger().sequence();
+        let sequence = env.ledger().sequence() as u64;
 
         // Simple deterministic hash combination (in production, use a proper hash function)
         (timestamp.wrapping_mul(31) ^ sequence.wrapping_mul(17) ^ proposer.to_string().len() as u64)
@@ -4564,6 +4528,7 @@ impl ProgramEscrowContract {
         failure_threshold: u32,
         success_threshold: u32,
         max_error_log: u32,
+        recovery_window: u64,
     ) {
         caller.require_auth();
         let admin = error_recovery::get_circuit_admin(&env).expect("Circuit admin not set");
@@ -4575,6 +4540,7 @@ impl ProgramEscrowContract {
             failure_threshold,
             success_threshold,
             max_error_log,
+            recovery_window,
         };
         error_recovery::set_config(&env, config);
     }
@@ -4853,10 +4819,7 @@ impl ProgramEscrowContract {
     ) -> Option<PayoutIdempotencyKey> {
         match idempotency_key {
             Some(key) => {
-                if validate_idempotency_key(key.as_str()).is_err() {
-                    panic!("IdempotencyKeyInvalid");
-                }
-
+                Self::validate_idempotency_key_format(key);
                 Self::check_idempotency_key(env, key)
             }
             None => None,
@@ -4867,8 +4830,24 @@ impl ProgramEscrowContract {
     ///
     /// This helper is kept for explicit format assertions in internal code.
     fn validate_idempotency_key_format(key: &String) {
-        if validate_idempotency_key(key.as_str()).is_err() {
+        let key_len = key.len() as usize;
+        if key_len < MIN_IDEMPOTENCY_KEY_LENGTH as usize || key_len > MAX_IDEMPOTENCY_KEY_LENGTH as usize {
             panic!("IdempotencyKeyInvalid");
+        }
+        let mut buf = [0u8; 128];
+        key.copy_into_slice(&mut buf[..key_len]);
+        let mut i = 0;
+        while i < key_len {
+            let b = buf[i];
+            let valid_char = (b >= b'a' && b <= b'z')
+                || (b >= b'A' && b <= b'Z')
+                || (b >= b'0' && b <= b'9')
+                || b == b'-'
+                || b == b'_';
+            if !valid_char {
+                panic!("IdempotencyKeyInvalid");
+            }
+            i += 1;
         }
     }
     /// Set or update the per-window spending limit for a program.
@@ -4940,10 +4919,10 @@ impl ProgramEscrowContract {
     /// # Events
     /// Emits `CB_THRESHOLD_SET` with [`CircuitBreakerThresholdSetEvent`].
     /// Set or update the per-program circuit breaker failure threshold.
-    pub fn set_program_circuit_breaker_threshold(
+    pub fn set_program_cb_threshold(
         env: Env,
         program_id: String,
-        threshold: Option<u8>,
+        threshold: Option<u32>,
     ) {
         let program_data = Self::get_program_data_by_id(&env, &program_id);
         program_data.authorized_payout_key.require_auth();
@@ -5491,11 +5470,6 @@ impl ProgramEscrowContract {
             (TOKEN_ALLOWLIST_UPDATED,),
             TokenAllowlistUpdatedEvent {
                 version: EVENT_VERSION_V2,
-                program_id: updated_data.program_id.clone(),
-                recipient_count: recipients.len() as u32,
-                total_amount: total_payout,
-                remaining_balance: updated_data.remaining_balance,
-                idempotency_key,
                 token,
                 added: false,
                 updated_by: admin,
@@ -5577,25 +5551,14 @@ impl ProgramEscrowContract {
     /// - Protected by reentrancy guard.
     /// - Respects circuit breaker and threshold limits.
     /// - Idempotency key ensures deterministic behavior on retries.
-    /// Execute a batch payout to multiple winners.
-    pub fn batch_payout(
-        env: Env,
-        recipients: soroban_sdk::Vec<Address>,
-        amounts: soroban_sdk::Vec<i128>,
-        idempotency_key: Option<String>,
-    ) -> ProgramData {
-        Self::batch_payout_internal(env, None, recipients, amounts, idempotency_key)
-    }
-
     /// Execute a batch payout with a specified caller.
     pub fn batch_payout_by(
         env: Env,
         caller: Address,
         recipients: soroban_sdk::Vec<Address>,
         amounts: soroban_sdk::Vec<i128>,
-        idempotency_key: Option<String>,
     ) -> ProgramData {
-        Self::batch_payout_internal(env, Some(caller), recipients, amounts, idempotency_key)
+        Self::batch_payout_internal(env, Some(caller), None, recipients, amounts)
     }
 
     /// Compute a deterministic Merkle root over a batch of `(recipient, amount)` pairs.
@@ -5663,7 +5626,6 @@ impl ProgramEscrowContract {
         idempotency_key: Option<String>,
         recipients: soroban_sdk::Vec<Address>,
         amounts: soroban_sdk::Vec<i128>,
-        idempotency_key: Option<String>,
     ) -> ProgramData {
         // Validation precedence (deterministic ordering):
         // 1.  Reentrancy guard
@@ -5903,10 +5865,10 @@ impl ProgramEscrowContract {
         env.storage().instance().set(&PROGRAM_DATA, &updated_data);
 
         // Store idempotency record (CEI: after state mutation, before event).
-        if let Some(key) = idempotency_key {
+        if let Some(ref key) = idempotency_key {
             Self::store_idempotency_record(
                 &env,
-                key,
+                key.clone(),
                 symbol_short!("batchpay"),
                 updated_data.program_id.clone(),
                 total_actual_outflow,
@@ -5924,6 +5886,7 @@ impl ProgramEscrowContract {
                 recipient_count: recipients.len() as u32,
                 total_amount: total_actual_outflow,
                 remaining_balance: updated_data.remaining_balance,
+                idempotency_key,
             },
         );
 
@@ -5941,17 +5904,6 @@ impl ProgramEscrowContract {
             .unwrap_or(0u32)
     }
 
-    /// Execute batch payouts with idempotency support.
-    ///
-    /// # Arguments
-    /// * `recipients` - Vector of winner addresses.
-    /// * `amounts` - Vector of prize amounts (must match recipients length).
-    /// * `idempotency_key` - Optional unique key to ensure idempotent behavior.
-    ///
-    /// # Returns
-    /// The updated `ProgramData` reflecting the new balance and payout history.
-    ///
-    /// # Idempotency
     /// - If `idempotency_key` is provided and already used, returns the stored result without re-executing.
     /// - If `idempotency_key` is provided and new, executes the payout and stores the key.
     /// - If `idempotency_key` is None, behaves like regular batch_payout.
@@ -5960,95 +5912,7 @@ impl ProgramEscrowContract {
     /// - Requires authorization from the `authorized_payout_key`.
     /// - Protected by reentrancy guard.
     /// - Respects circuit breaker and threshold limits.
-    pub fn batch_payout_idempotent(
-        env: Env,
-        recipients: Vec<Address>,
-        amounts: Vec<i128>,
-        idempotency_key: Option<String>,
-    ) -> ProgramData {
-        Self::batch_payout_idempotent_internal(env, None, recipients, amounts, idempotency_key)
-    }
 
-    pub fn batch_payout_idempotent_by(
-        env: Env,
-        caller: Address,
-        recipients: Vec<Address>,
-        amounts: Vec<i128>,
-        idempotency_key: Option<String>,
-    ) -> ProgramData {
-        Self::batch_payout_idempotent_internal(
-            env,
-            Some(caller),
-            recipients,
-            amounts,
-            idempotency_key,
-        )
-    }
-
-    fn batch_payout_idempotent_internal(
-        env: Env,
-        caller: Option<Address>,
-        recipients: Vec<Address>,
-        amounts: Vec<i128>,
-        idempotency_key: Option<String>,
-    ) -> ProgramData {
-        // Check if idempotency key already exists
-        if let Some(existing_record) =
-            Self::validate_and_get_idempotency_key(&env, &idempotency_key)
-        {
-            // Key already used - return existing state without re-executing
-            // This ensures idempotent behavior
-            let program_data: ProgramData = env
-                .storage()
-                .instance()
-                .get(&PROGRAM_DATA)
-                .unwrap_or_else(|| panic!("Program not initialized"));
-
-            // Emit event indicating idempotent replay
-            env.events().publish(
-                (symbol_short!("IdmReplay"),),
-                (
-                    existing_record.key.clone(),
-                    existing_record.program_id.clone(),
-                    existing_record.total_amount,
-                ),
-            );
-
-            return program_data;
-        }
-
-        // Execute normal batch payout
-        let program_data = Self::batch_payout_internal(
-            env.clone(),
-            caller,
-            recipients.clone(),
-            amounts.clone(),
-            None,
-        );
-
-        // Store idempotency key if provided (store all recipients and amounts)
-        if let Some(key) = &idempotency_key {
-            // Calculate total amount
-            let mut total_amount: i128 = 0;
-            for amount in amounts.iter() {
-                total_amount = crate::token_math::safe_add(total_amount, amount);
-            }
-
-            Self::store_idempotency_key(
-                &env,
-                key,
-                &program_data.program_id,
-                PayoutType::Batch(recipients.len() as u32),
-                None, // No single recipient for batch
-                None, // No single amount for batch
-                Some(recipients),
-                Some(amounts),
-                total_amount,
-            );
-        }
-
-        program_data
-    }
 
     /// Execute a single payout to one winner.
     ///
@@ -6600,7 +6464,7 @@ impl ProgramEscrowContract {
     fn trigger_program_releases_internal(env: Env, caller: Option<Address>) -> u32 {
         reentrancy_guard::acquire(&env);
 
-        let program_data: ProgramData = env
+        let mut program_data: ProgramData = env
             .storage()
             .instance()
             .get(&PROGRAM_DATA)
@@ -6615,12 +6479,12 @@ impl ProgramEscrowContract {
             panic!("Funds Paused");
         }
 
-        let schedules: soroban_sdk::Vec<ProgramReleaseSchedule> = env
+        let mut schedules: soroban_sdk::Vec<ProgramReleaseSchedule> = env
             .storage()
             .instance()
             .get(&SCHEDULES)
             .unwrap_or_else(|| Vec::new(&env));
-        let release_history: soroban_sdk::Vec<ProgramReleaseHistory> = env
+        let mut release_history: soroban_sdk::Vec<ProgramReleaseHistory> = env
             .storage()
             .instance()
             .get(&RELEASE_HISTORY)
@@ -6778,13 +6642,7 @@ impl ProgramEscrowContract {
     // Multi-tenant / Multi-program Migration Wrappers (ignore id for now)
     // ========================================================================
 
-    pub fn get_program_info_v2(env: Env, program_id: String) -> ProgramData {
-        let program_key = DataKey::Program(program_id);
-        env.storage()
-            .instance()
-            .get(&program_key)
-            .unwrap_or_else(|| panic!("Program not found"))
-    }
+
 
     pub fn lock_program_funds_v2(env: Env, program_id: String, amount: i128) -> ProgramData {
         Self::require_not_read_only(&env);
@@ -6920,7 +6778,7 @@ impl ProgramEscrowContract {
         merkle_root: soroban_sdk::BytesN<32>,
     ) -> BatchReceipt {
         let program_data =
-            Self::batch_payout(env.clone(), recipients.clone(), amounts.clone(), None);
+            Self::batch_payout(env.clone(), recipients.clone(), amounts.clone());
 
         let batch_id_key = BatchReceiptKey::NextId;
         let batch_id: u64 = env.storage().persistent().get(&batch_id_key).unwrap_or(0);
@@ -6967,7 +6825,7 @@ impl ProgramEscrowContract {
         recipients: soroban_sdk::Vec<Address>,
         amounts: soroban_sdk::Vec<i128>,
     ) -> ProgramData {
-        Self::batch_payout(env, recipients, amounts, None)
+        Self::batch_payout(env, recipients, amounts)
     }
 
     /// Retrieve a stored batch payout receipt by its receipt ID.
@@ -7116,17 +6974,7 @@ impl ProgramEscrowContract {
 
     /// Query idempotency key status
     ///
-    /// # Arguments
-    /// * `idempotency_key` - The idempotency key to query
-    ///
-    /// # Returns
-    /// Some(PayoutIdempotencyKey) if the key exists, None otherwise
-    pub fn get_idempotency_key_status(
-        env: Env,
-        idempotency_key: String,
-    ) -> Option<PayoutIdempotencyKey> {
-        Self::check_idempotency_key(&env, &idempotency_key)
-    }
+
 
     /// Query payout history by amount range
     pub fn query_payouts_by_amount(
@@ -7186,15 +7034,8 @@ impl ProgramEscrowContract {
             .get(&SCHEDULES)
             .unwrap_or_else(|| Vec::new(&env));
 
-        pub fn preview_split(
-            env: Env,
-            program_id: String,
-            total_amount: i128,
-        ) -> soroban_sdk::Vec<BeneficiarySplit> {
-            payout_splits::preview_split(&env, &program_id, total_amount)
-        }
         Self::paginate_filtered(&env, schedules, offset, limit, |schedule| {
-            schedule.released == released
+            schedule.recipient == recipient
         })
     }
 
@@ -7382,6 +7223,17 @@ impl ProgramEscrowContract {
             });
         }
         result
+    }
+
+    pub fn query_all_delegates(env: Env, program_id: String) -> soroban_sdk::Vec<ProgramDelegateInfo> {
+        let mut results = soroban_sdk::Vec::new(&env);
+        let delegates = Self::query_program_delegates(env.clone(), None, None);
+        for d in delegates.iter() {
+            if d.program_id == program_id {
+                results.push_back(d);
+            }
+        }
+        results
     }
 
     pub fn get_program_release_schedule(env: Env, schedule_id: u64) -> ProgramReleaseSchedule {
@@ -7606,16 +7458,7 @@ impl ProgramEscrowContract {
     // Dispute Resolution
     // ========================================================================
 
-    /// Returns the current dispute state for this contract instance.
-    ///
-    /// `DisputeState::None` is returned when no dispute record exists.
-    fn dispute_state(env: &Env) -> DisputeState {
-        env.storage()
-            .instance()
-            .get::<DataKey, DisputeRecord>(&DataKey::Dispute)
-            .map(|r| r.state)
-            .unwrap_or(DisputeState::None)
-    }
+
 
     /// Open a dispute on the program, blocking all payouts until resolved.
     ///
