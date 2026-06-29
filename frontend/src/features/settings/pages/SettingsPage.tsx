@@ -6,6 +6,7 @@ import { PayoutTab } from '../components/payout/PayoutTab';
 import { BillingTab } from '../components/billing/BillingTab';
 import { TermsTab } from '../components/terms/TermsTab';
 import { ReferralLink } from '../../dashboard/components/ReferralLink';
+import { TaxDocumentsTab } from '../components/tax-documents/TaxDocumentsTab';
 import { useTheme } from '../../../shared/contexts/ThemeContext';
 import { BillingProfilesProvider } from '../contexts/BillingProfilesContext';
 import { RestartTutorialButton } from '../../onboarding';
@@ -25,6 +26,7 @@ export function SettingsPage({ initialTab = 'profile' }: SettingsPageProps) {
     { id: 'billing', label: 'Billing Profiles' },
     { id: 'referrals', label: 'Referrals' },
     { id: 'terms', label: 'Terms and Conditions' },
+    { id: 'tax-documents', label: 'Tax Documents' },
   ];
 
   return (
@@ -64,6 +66,7 @@ export function SettingsPage({ initialTab = 'profile' }: SettingsPageProps) {
         {activeTab === 'billing' && <BillingTab />}
         {activeTab === 'referrals' && <ReferralLink />}
         {activeTab === 'terms' && <TermsTab />}
+        {activeTab === 'tax-documents' && <TaxDocumentsTab />}
 
         {/* Persistent onboarding re-entry point — visible on every tab */}
         <RestartTutorialButton />

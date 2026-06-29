@@ -1,4 +1,5 @@
 // Tab types
+export type SettingsTabType = 'profile' | 'notifications' | 'payout' | 'billing' | 'terms' | 'referrals' | 'tax-documents';
 export type SettingsTabType = 'profile' | 'notifications' | 'payout' | 'billing' | 'terms' | 'referrals';
 
 // Billing Profile types
@@ -88,4 +89,23 @@ export interface WalletAddresses {
     usdt: string;
     xlm: string;
   };
+}
+
+// Tax Document types
+export type TaxDocumentStatus = 'available' | 'pending' | 'not-applicable';
+
+export interface TaxDocument {
+  /** Calendar year this document covers, e.g. 2024 */
+  year: number;
+  status: TaxDocumentStatus;
+  /** Total earnings for the year */
+  totalEarnings: number;
+  currency: string;
+  stellarAddress: string;
+  downloadUrl?: string;
+}
+
+export interface TaxDocumentYearRange {
+  from: number;
+  to: number;
 }
