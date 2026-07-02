@@ -674,6 +674,11 @@ pub enum ProgramStatus {
 /// contract.set_program_circuit_breaker_threshold(&program_id, &None);
 /// ```
 
+<<<<<<< fix/optimize-program-data-struct-field-ordering
+// schema_version: 2
+// Field ordering optimized for Soroban XDR write cost: fixed-size hot-path fields
+// come first so partial-update patterns touch the smallest possible XDR prefix.
+=======
 /// Configuration for fee-on-transfer (FoT) token routing via an AMM router.
 ///
 /// When set, the contract queries the router for a quote before each payout
@@ -709,27 +714,35 @@ pub struct FotRouterClearedEvent {
     pub timestamp: u64,
 }
 
+>>>>>>> master
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ProgramData {
-    pub program_id: String,
-    pub total_funds: i128,
+    // --- Hot path: small fixed-size fields accessed on every operation ---
+    pub status: ProgramStatus,
     pub remaining_balance: i128,
+    pub total_funds: i128,
     pub authorized_payout_key: Address,
+    pub token_address: Address,
+    // --- Moderate: access-control and security fields ---
     pub delegate: Option<Address>,
     pub delegate_permissions: u32,
-    pub payout_history: soroban_sdk::Vec<PayoutRecord>,
-    pub token_address: Address,
-    pub initial_liquidity: i128,
     pub risk_flags: u32,
-    pub reference_hash: Option<soroban_sdk::Bytes>,
     pub archived: bool,
     pub archived_at: Option<u64>,
-    pub status: ProgramStatus,
+    pub initial_liquidity: i128,
     /// Optional per-program circuit breaker failure threshold.
     /// If set, overrides the global default (3) for this program.
     /// Must be between 1 and 100 inclusive when set.
+<<<<<<< fix/optimize-program-data-struct-field-ordering
+    pub circuit_breaker_threshold: Option<u8>,
+    // --- Cold path: variable-size fields written infrequently ---
+    pub program_id: String,
+    pub payout_history: soroban_sdk::Vec<PayoutRecord>,
+    pub reference_hash: Option<soroban_sdk::Bytes>,
+=======
     pub circuit_breaker_threshold: Option<u32>,
+>>>>>>> master
 }
 
 /// Program delegate audit record used for bulk reporting and indexer views.
@@ -1682,7 +1695,8 @@ pub const MAX_BATCH_SIZE: u32 = 100;
 pub const DEFAULT_MAX_HISTORY_PAGE_LIMIT: u32 = 200;
 
 /// Current storage schema version constant (upgrade-safe marker).
-pub const STORAGE_SCHEMA_VERSION: u32 = 1;
+/// Bumped to 2 after ProgramData field reordering (schema_version: 2).
+pub const STORAGE_SCHEMA_VERSION: u32 = 2;
 
 /// Current spend-limit threshold storage schema version.
 ///
@@ -1836,6 +1850,7 @@ mod tests;
 
 mod test_maintenance_mode;
 mod test_risk_flags;
+mod test_struct_layout;
 // #[cfg(test)] mod test_serialization_compatibility; // pre-existing breakage
 // #[cfg(test)] mod test_payout_splits; // pre-existing breakage
 
