@@ -38,6 +38,11 @@ import { ContributionHeatmap } from "../components/ContributionHeatmap";
 import { RewardsChart } from "../components/RewardsChart";
 import { EmptyState } from "../../../shared/components/EmptyState";
 
+/**
+ * Design contract for the proposed ProfilePage skill endorsement UI.
+ * See: design/specs/skill-endorsement-ui.md
+ */
+
 interface ProfileData {
   contributions_count: number;
   languages: Array<{ language: string; contribution_count: number }>;
