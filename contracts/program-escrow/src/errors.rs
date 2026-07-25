@@ -734,6 +734,55 @@ pub enum ContractError {
     /// This error occurs when role rotation is temporarily disabled
     /// due to contract state (e.g., emergency mode, dispute, etc.).
     RoleRotationNotAllowed = 1208,
+
+    // =========================================================================
+    // Dynamic Pricing Errors (1300-1399)
+    // =========================================================================
+
+    /// Oracle data is stale.
+    ///
+    /// This error occurs when oracle data exceeds the staleness threshold.
+    OracleDataStale = 1300,
+
+    /// Oracle data is invalid.
+    ///
+    /// This error occurs when oracle data fails validation checks.
+    OracleDataInvalid = 1301,
+
+    /// Price change exceeds limit.
+    ///
+    /// This error occurs when a price change would exceed the maximum allowed change.
+    PriceChangeExceedsLimit = 1302,
+
+    /// Update too soon.
+    ///
+    /// This error occurs when attempting to update prices before the minimum interval.
+    UpdateTooSoon = 1303,
+
+    /// Dynamic pricing configuration invalid.
+    ///
+    /// This error occurs when dynamic pricing configuration parameters are invalid.
+    InvalidDynamicPricingConfig = 1304,
+
+    /// Pricing calculation overflow.
+    ///
+    /// This error occurs when pricing calculations would overflow.
+    PricingCalculationOverflow = 1305,
+
+    /// Oracle not configured.
+    ///
+    /// This error occurs when attempting to use oracle without configuration.
+    OracleNotConfigured = 1306,
+
+    /// Oracle call failed.
+    ///
+    /// This error occurs when oracle data retrieval fails.
+    OracleCallFailed = 1307,
+
+    /// Dynamic pricing not enabled.
+    ///
+    /// This error occurs when dynamic pricing operations are attempted while disabled.
+    DynamicPricingNotEnabled = 1308,
 }
 
 /// Explicit error enum for all batch payout failure modes.
@@ -920,6 +969,17 @@ impl ContractError {
             ContractError::BatchItemNotFound => "Batch item not found",
             ContractError::BatchItemAlreadyProcessed => "Batch item already processed",
             ContractError::MaxRetriesExceeded => "Maximum retries exceeded",
+            
+            // Dynamic Pricing Errors
+            ContractError::OracleDataStale => "Oracle data is stale",
+            ContractError::OracleDataInvalid => "Oracle data is invalid",
+            ContractError::PriceChangeExceedsLimit => "Price change exceeds limit",
+            ContractError::UpdateTooSoon => "Update too soon",
+            ContractError::InvalidDynamicPricingConfig => "Invalid dynamic pricing configuration",
+            ContractError::PricingCalculationOverflow => "Pricing calculation overflow",
+            ContractError::OracleNotConfigured => "Oracle not configured",
+            ContractError::OracleCallFailed => "Oracle call failed",
+            ContractError::DynamicPricingNotEnabled => "Dynamic pricing not enabled",
 
             // Token Allowlist Errors
             ContractError::TokenNotAllowed => "Token is not on the allowlist",
