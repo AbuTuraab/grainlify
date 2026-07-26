@@ -6803,11 +6803,15 @@ impl ProgramEscrowContract {
             snapshot_schedules = Some(snapshot.schedules);
         }
 
-        // store a tuple of (main_schedule_index, Option<frozen_schedule>)
-        let mut due_entries: soroban_sdk::Vec<(u32, Option<ProgramReleaseSchedule>)> = Vec::new(&env);
+        // store a tuple of (main_schedule_index, snap_schedule_index) where u32::MAX means no snap schedule
+        let mut due_entries: soroban_sdk::Vec<u64> = Vec::new(&env);
+        // Pack (main_index, snap_index) into a single u64 for easier use with vec_insert_at if needed, but let's just use two u32s encoded as u64
+        // High 32 bits = main_index, Low 32 bits = snap_index
         
-        if let Some(snap_scheds) = snapshot_schedules {
-            for s in snap_scheds.iter() {
+        if let Some(ref snap_scheds) = snapshot_schedules {
+            let snap_len = snap_scheds.len();
+            for snap_i in 0..snap_len {
+                let s = snap_scheds.get(snap_i).unwrap();
                 // Find matching schedule_id in main schedules
                 for i in 0..len {
                     let existing = schedules.get(i).unwrap();
@@ -6815,16 +6819,17 @@ impl ProgramEscrowContract {
                         // Insert-sort by schedule_id (ascending)
                         let mut inserted = false;
                         for j in 0..due_entries.len() {
-                            let entry = due_entries.get(j).unwrap();
-                            let existing_in_list = schedules.get(entry.0).unwrap();
+                            let entry_packed = due_entries.get(j).unwrap();
+                            let existing_in_list = schedules.get((entry_packed >> 32) as u32).unwrap();
                             if existing.schedule_id < existing_in_list.schedule_id {
-                                due_entries = Self::vec_insert_at_entry(&env, due_entries, j, (i, Some(s.clone())));
+                                let packed = ((i as u64) << 32) | (snap_i as u64);
+                                due_entries = Self::vec_insert_at_u64(&env, due_entries, j, packed);
                                 inserted = true;
                                 break;
                             }
                         }
                         if !inserted {
-                            due_entries.push_back((i, Some(s.clone())));
+                            due_entries.push_back(((i as u64) << 32) | (snap_i as u64));
                         }
                         break; // Move to next snap schedule
                     }
@@ -6837,16 +6842,17 @@ impl ProgramEscrowContract {
                     // Insert-sort by schedule_id (ascending) for determinism
                     let mut inserted = false;
                     for j in 0..due_entries.len() {
-                        let entry = due_entries.get(j).unwrap();
-                        let existing = schedules.get(entry.0).unwrap();
-                        if s.schedule_id < existing.schedule_id {
-                            due_entries = Self::vec_insert_at_entry(&env, due_entries, j, (i, None));
+                        let entry_packed = due_entries.get(j).unwrap();
+                        let existing_in_list = schedules.get((entry_packed >> 32) as u32).unwrap();
+                        if s.schedule_id < existing_in_list.schedule_id {
+                            let packed = ((i as u64) << 32) | (u32::MAX as u64);
+                            due_entries = Self::vec_insert_at_u64(&env, due_entries, j, packed);
                             inserted = true;
                             break;
                         }
                     }
                     if !inserted {
-                        due_entries.push_back((i, None));
+                        due_entries.push_back(((i as u64) << 32) | (u32::MAX as u64));
                     }
                 }
             }
@@ -6854,13 +6860,17 @@ impl ProgramEscrowContract {
 
         // Process due schedules in sorted order; skip (don't panic) on insufficient balance
         for k in 0..due_entries.len() {
-            let entry = due_entries.get(k).unwrap();
-            let i = entry.0;
+            let entry_packed = due_entries.get(k).unwrap();
+            let i = (entry_packed >> 32) as u32;
+            let snap_i = (entry_packed & 0xFFFFFFFF) as u32;
             let mut schedule = schedules.get(i).unwrap();
-            let frozen_schedule = entry.1;
 
-            let exec_amount = frozen_schedule.clone().map(|s| s.amount).unwrap_or(schedule.amount);
-            let exec_recipient = frozen_schedule.map(|s| s.recipient).unwrap_or(schedule.recipient.clone());
+            let (exec_amount, exec_recipient) = if snap_i != u32::MAX {
+                let s = snapshot_schedules.as_ref().unwrap().get(snap_i).unwrap();
+                (s.amount, s.recipient.clone())
+            } else {
+                (schedule.amount, schedule.recipient.clone())
+            };
 
             // Skip schedule if contract has insufficient balance — deferred to next trigger
             if exec_amount > program_data.remaining_balance {
@@ -6952,16 +6962,16 @@ impl ProgramEscrowContract {
         result
     }
 
-    fn vec_insert_at_entry(
+    fn vec_insert_at_u64(
         env: &Env,
-        v: soroban_sdk::Vec<(u32, Option<ProgramReleaseSchedule>)>,
+        v: soroban_sdk::Vec<u64>,
         pos: u32,
-        value: (u32, Option<ProgramReleaseSchedule>),
-    ) -> soroban_sdk::Vec<(u32, Option<ProgramReleaseSchedule>)> {
-        let mut result: soroban_sdk::Vec<(u32, Option<ProgramReleaseSchedule>)> = Vec::new(env);
+        value: u64,
+    ) -> soroban_sdk::Vec<u64> {
+        let mut result: soroban_sdk::Vec<u64> = Vec::new(env);
         for i in 0..v.len() {
             if i == pos {
-                result.push_back(value.clone());
+                result.push_back(value);
             }
             result.push_back(v.get(i).unwrap());
         }
