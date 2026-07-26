@@ -150,6 +150,13 @@ mod errors;
 pub use errors::BatchPayoutError;
 use errors::ContractError;
 
+mod dynamic_pricing;
+pub use dynamic_pricing::{
+    DynamicPricingConfig, PricingState, PricingEngine, PricingError,
+    DemandMetrics, SupplyMetrics, OracleMarketData, PriceUpdateEvent,
+    update_demand_metrics, update_supply_metrics, get_dynamic_fee,
+};
+
 // Event types
 const PROGRAM_INITIALIZED: Symbol = symbol_short!("PrgInit");
 const FUNDS_LOCKED: Symbol = symbol_short!("FndsLock");
@@ -177,8 +184,8 @@ const ADMIN_ROTATION_CANCELLED: Symbol = symbol_short!("AdmCanc");
 const CONTROLLER_PROPOSED: Symbol = symbol_short!("CtrlProp");
 const CONTROLLER_ACCEPTED: Symbol = symbol_short!("CtrlAcc");
 const CONTROLLER_ROTATION_CANCELLED: Symbol = symbol_short!("CtrlCanc");
-const FOT_ROUTER_SET: Symbol = symbol_short!("FotRtrS");
-const FOT_ROUTER_CLEARED: Symbol = symbol_short!("FotRtrC");
+const PRICE_UPDATED: Symbol = symbol_short!("PriceUpd");
+const DYNAMIC_PRICING_CONFIG_UPDATED: Symbol = symbol_short!("DynPricCfg");
 
 // Storage keys
 const PROGRAM_DATA: Symbol = symbol_short!("ProgData");
@@ -190,6 +197,11 @@ const PROGRAM_INDEX: Symbol = symbol_short!("ProgIdx");
 const AUTH_KEY_INDEX: Symbol = symbol_short!("AuthIdx");
 const FEE_CONFIG: Symbol = symbol_short!("FeeCfg");
 const FEE_COLLECTED: Symbol = symbol_short!("FeeCol");
+const DYNAMIC_PRICING_CONFIG: Symbol = symbol_short!("DynPric");
+const PRICING_STATE: Symbol = symbol_short!("PricSt");
+const DEMAND_METRICS: Symbol = symbol_short!("DmndMtr");
+const SUPPLY_METRICS: Symbol = symbol_short!("SuppMtr");
+const ORACLE_DATA: Symbol = symbol_short!("OraclD");
 /// Storage key for the set of consumed idempotency keys (batch payout).
 const PAYOUT_IDEM_KEYS: Symbol = symbol_short!("PayIdem");
 /// Event symbol emitted when a batch_payout replay is detected.
@@ -674,45 +686,6 @@ pub enum ProgramStatus {
 /// contract.set_program_circuit_breaker_threshold(&program_id, &None);
 /// ```
 
-// schema_version: 2
-// Field ordering optimized for Soroban XDR write cost: fixed-size hot-path fields
-// come first so partial-update patterns touch the smallest possible XDR prefix.
-
-/// Configuration for fee-on-transfer (FoT) token routing via an AMM router.
-///
-/// When set, the contract queries the router for a quote before each payout
-/// transfer to compute the gross amount needed to deliver the intended net
-/// amount after any FoT deductions.
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct FotRouter {
-    /// Address of the router contract that implements `quote(Address, i128) -> i128`.
-    pub router_contract: Address,
-    /// Slippage tolerance in basis points (1 bp = 0.01%).
-    /// Applied as a buffer on top of the quoted amount.
-    pub slippage_bps: u32,
-}
-
-/// Event emitted when the FoT router configuration is set or updated.
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct FotRouterSetEvent {
-    pub version: u32,
-    pub router_contract: Address,
-    pub slippage_bps: u32,
-    pub set_by: Address,
-    pub timestamp: u64,
-}
-
-/// Event emitted when the FoT router configuration is cleared.
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct FotRouterClearedEvent {
-    pub version: u32,
-    pub set_by: Address,
-    pub timestamp: u64,
-}
-
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ProgramData {
@@ -728,27 +701,11 @@ pub struct ProgramData {
     pub risk_flags: u32,
     pub archived: bool,
     pub archived_at: Option<u64>,
-    pub initial_liquidity: i128,
+    pub status: ProgramStatus,
     /// Optional per-program circuit breaker failure threshold.
     /// If set, overrides the global default (3) for this program.
     /// Must be between 1 and 100 inclusive when set.
     pub circuit_breaker_threshold: Option<u8>,
-    // --- Cold path: variable-size fields written infrequently ---
-    pub program_id: String,
-    pub payout_history: soroban_sdk::Vec<PayoutRecord>,
-    pub reference_hash: Option<soroban_sdk::Bytes>,
-}
-
-/// Program delegate audit record used for bulk reporting and indexer views.
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ProgramDelegateInfo {
-    /// Program identifier
-    pub program_id: String,
-    /// Currently assigned delegate (if any)
-    pub delegate: Option<Address>,
-    /// Delegate permission bitmask
-    pub permissions: u32,
 }
 
 // ========================================================================
@@ -903,9 +860,9 @@ pub struct CircuitBreakerThresholdSetEvent {
     /// Program the threshold applies to.
     pub program_id: String,
     /// Previous threshold value (None = not set, uses global default of 3).
-    pub previous_threshold: Option<u32>,
+    pub previous_threshold: Option<u8>,
     /// New threshold value (None = reset to global default of 3).
-    pub new_threshold: Option<u32>,
+    pub new_threshold: Option<u8>,
     /// Admin that made the change.
     pub set_by: Address,
     /// Ledger timestamp.
@@ -1277,8 +1234,18 @@ pub enum DataKey {
     SpendLimitSchemaVersion,
     PauseSchemaVersion,
     TokenAllowlist,
-    TokenAllowlistV2,
-    TokenDecimals(Address),
+    /// Dynamic pricing configuration
+    DynamicPricingConfig,
+    /// Dynamic pricing state
+    PricingState,
+    /// Demand metrics for dynamic pricing
+    DemandMetrics,
+    /// Supply metrics for dynamic pricing
+    SupplyMetrics,
+    /// Oracle data for dynamic pricing
+    OracleData,
+    /// Upgrade-safe schema version marker for token-allowlist storage.
+    /// Written on init; increment when the allowlist storage layout changes.
     TokenAllowlistSchemaVersion,
     SpendingConfig(String),
     SpendingState(String),
@@ -2429,7 +2396,6 @@ impl ProgramEscrowContract {
             archived_at: None,
             status: ProgramStatus::Draft,
             circuit_breaker_threshold: None,
-            fot_router: OptionalFotRouter::None,
         };
 
         // Store program data in registry
@@ -2805,7 +2771,6 @@ impl ProgramEscrowContract {
                 archived_at: None,
                 status: ProgramStatus::Draft,
                 circuit_breaker_threshold: None,
-                fot_router: OptionalFotRouter::None,
             };
             let program_key = DataKey::Program(program_id.clone());
             env.storage().instance().set(&program_key, &program_data);
@@ -5172,11 +5137,10 @@ impl ProgramEscrowContract {
     ///
     /// # Events
     /// Emits `CB_THRESHOLD_SET` with [`CircuitBreakerThresholdSetEvent`].
-    /// Set or update the per-program circuit breaker failure threshold.
-    pub fn set_program_cb_threshold(
+    pub fn set_program_circuit_breaker_threshold(
         env: Env,
         program_id: String,
-        threshold: Option<u32>,
+        threshold: Option<u8>,
     ) {
         let program_data = Self::get_program_data_by_id(&env, &program_id);
         program_data.authorized_payout_key.require_auth();
@@ -5188,11 +5152,9 @@ impl ProgramEscrowContract {
             }
         }
 
-        let previous_threshold = program_data
-            .circuit_breaker_threshold
-            .map(|value| value as u32);
+        let previous_threshold = program_data.circuit_breaker_threshold;
         let mut updated_data = program_data.clone();
-        updated_data.circuit_breaker_threshold = threshold.map(|value| value as u8);
+        updated_data.circuit_breaker_threshold = threshold;
 
         // Update program data
         let program_key = DataKey::Program(program_id.clone());
@@ -7936,6 +7898,310 @@ impl ProgramEscrowContract {
             overall_score_bps,
         }
     }
+
+    // ========================================================================
+    // Dynamic Pricing Functions
+    // ========================================================================
+
+    /// Configure dynamic pricing settings. Admin-only.
+    ///
+    /// # Arguments
+    /// * `enabled` - Whether dynamic pricing is enabled
+    /// * `base_fee_bps` - Base fee rate in basis points
+    /// * `max_fee_bps` - Maximum fee rate in basis points
+    /// * `min_fee_bps` - Minimum fee rate in basis points
+    /// * `max_change_bps` - Maximum price change per period in basis points
+    /// * `smoothing_alpha_bps` - Price smoothing factor in basis points
+    /// * `min_update_interval` - Minimum time between price updates in seconds
+    /// * `oracle_address` - Optional oracle contract address
+    /// * `use_demand_pricing` - Whether to use demand-based pricing
+    /// * `use_supply_pricing` - Whether to use supply-based pricing
+    /// * `use_time_decay` - Whether to use time-decay pricing
+    ///
+    /// # Events
+    /// Emits `DynPricCfg` with configuration details.
+    pub fn configure_dynamic_pricing(
+        env: Env,
+        enabled: bool,
+        base_fee_bps: i128,
+        max_fee_bps: i128,
+        min_fee_bps: i128,
+        max_change_bps: i128,
+        smoothing_alpha_bps: i128,
+        min_update_interval: u64,
+        oracle_address: Option<Address>,
+        use_demand_pricing: bool,
+        use_supply_pricing: bool,
+        use_time_decay: bool,
+    ) {
+        let admin = Self::require_admin(&env);
+
+        // Validate configuration parameters
+        if base_fee_bps < 0 || base_fee_bps > 10000 {
+            panic!("Invalid base fee rate");
+        }
+        if max_fee_bps < min_fee_bps {
+            panic!("Max fee must be >= min fee");
+        }
+        if max_change_bps < 0 || max_change_bps > 10000 {
+            panic!("Invalid max change rate");
+        }
+        if smoothing_alpha_bps < 0 || smoothing_alpha_bps > 10000 {
+            panic!("Invalid smoothing alpha");
+        }
+        if min_update_interval == 0 {
+            panic!("Min update interval must be > 0");
+        }
+
+        let config = DynamicPricingConfig {
+            enabled,
+            base_fee_bps,
+            max_fee_bps,
+            min_fee_bps,
+            max_change_bps,
+            smoothing_alpha_bps,
+            min_update_interval,
+            oracle_address,
+            use_demand_pricing,
+            use_supply_pricing,
+            use_time_decay,
+        };
+
+        // Initialize pricing state if not exists
+        if !env.storage().instance().has(&DataKey::PricingState) {
+            let initial_state = PricingState::initial(&env, base_fee_bps);
+            env.storage().instance().set(&DataKey::PricingState, &initial_state);
+        }
+
+        env.storage().instance().set(&DataKey::DynamicPricingConfig, &config);
+
+        env.events().publish(
+            (DYNAMIC_PRICING_CONFIG_UPDATED,),
+            (
+                enabled,
+                base_fee_bps,
+                max_fee_bps,
+                min_fee_bps,
+                max_change_bps,
+                smoothing_alpha_bps,
+                min_update_interval,
+                admin,
+                env.ledger().timestamp(),
+            ),
+        );
+    }
+
+    /// Get current dynamic pricing configuration.
+    pub fn get_dynamic_pricing_config(env: Env) -> Option<DynamicPricingConfig> {
+        env.storage().instance().get(&DataKey::DynamicPricingConfig)
+    }
+
+    /// Get current pricing state.
+    pub fn get_pricing_state(env: Env) -> Option<PricingState> {
+        env.storage().instance().get(&DataKey::PricingState)
+    }
+
+    /// Update demand metrics for dynamic pricing. Admin-only.
+    ///
+    /// # Arguments
+    /// * `tx_count` - Transaction count in current window
+    /// * `total_volume` - Total volume in current window
+    /// * `unique_users` - Number of unique users
+    /// * `avg_tx_size` - Average transaction size
+    /// * `growth_rate_bps` - Growth rate vs previous window in basis points
+    pub fn update_demand_metrics(
+        env: Env,
+        tx_count: u64,
+        total_volume: i128,
+        unique_users: u64,
+        avg_tx_size: i128,
+        growth_rate_bps: i128,
+    ) {
+        Self::require_admin(&env);
+
+        let metrics = DemandMetrics {
+            tx_count,
+            total_volume,
+            unique_users,
+            avg_tx_size,
+            growth_rate_bps,
+        };
+        env.storage().instance().set(&DataKey::DemandMetrics, &metrics);
+    }
+
+    /// Update supply metrics for dynamic pricing. Admin-only.
+    ///
+    /// # Arguments
+    /// * `total_liquidity` - Total liquidity available
+    /// * `utilization_bps` - Utilization rate in basis points
+    /// * `available_liquidity` - Available liquidity
+    /// * `locked_liquidity` - Locked liquidity
+    pub fn update_supply_metrics(
+        env: Env,
+        total_liquidity: i128,
+        utilization_bps: i128,
+        available_liquidity: i128,
+        locked_liquidity: i128,
+    ) {
+        Self::require_admin(&env);
+
+        let metrics = SupplyMetrics {
+            total_liquidity,
+            utilization_bps,
+            available_liquidity,
+            locked_liquidity,
+        };
+        env.storage().instance().set(&DataKey::SupplyMetrics, &metrics);
+    }
+
+    /// Update oracle data for dynamic pricing. Admin-only.
+    ///
+    /// # Arguments
+    /// * `token_price` - Current token price
+    /// * `volume_24h` - 24h trading volume
+    /// * `market_cap` - Current market cap
+    /// * `volatility_bps` - Volatility index in basis points
+    /// * `timestamp` - Oracle data timestamp
+    /// * `signature` - Optional oracle signature
+    pub fn update_oracle_data(
+        env: Env,
+        token_price: i128,
+        volume_24h: i128,
+        market_cap: i128,
+        volatility_bps: i128,
+        timestamp: u64,
+        signature: Option<Bytes>,
+    ) {
+        Self::require_admin(&env);
+
+        let oracle_data = OracleMarketData {
+            token_price,
+            volume_24h,
+            market_cap,
+            volatility_bps,
+            timestamp,
+            signature,
+        };
+
+        // Validate oracle data
+        PricingEngine::validate_oracle_data(&env, &oracle_data)
+            .expect("Invalid oracle data");
+
+        env.storage().instance().set(&DataKey::OracleData, &oracle_data);
+    }
+
+    /// Trigger a dynamic price update. Admin-only.
+    ///
+    /// This function calculates a new fee based on current metrics and
+    /// updates the pricing state if the change is within allowed limits.
+    ///
+    /// # Events
+    /// Emits `PriceUpd` with price update details.
+    pub fn update_dynamic_price(env: Env) {
+        Self::require_admin(&env);
+
+        let config: DynamicPricingConfig = env
+            .storage()
+            .instance()
+            .get(&DataKey::DynamicPricingConfig)
+            .expect("Dynamic pricing not configured");
+
+        if !config.enabled {
+            panic!("Dynamic pricing is not enabled");
+        }
+
+        let state: PricingState = env
+            .storage()
+            .instance()
+            .get(&DataKey::PricingState)
+            .expect("Pricing state not initialized");
+
+        // Get metrics if available
+        let demand_metrics = env.storage().instance().get(&DataKey::DemandMetrics);
+        let supply_metrics = env.storage().instance().get(&DataKey::SupplyMetrics);
+        let oracle_data = env.storage().instance().get(&DataKey::OracleData);
+
+        // Calculate new fee
+        let calculation = PricingEngine::calculate_fee(
+            &env,
+            &config,
+            &state,
+            demand_metrics.as_ref(),
+            supply_metrics.as_ref(),
+            oracle_data.as_ref(),
+        ).expect("Fee calculation failed");
+
+        let previous_fee = state.current_fee_bps;
+        let new_fee = calculation.final_fee_bps;
+
+        // Update pricing state
+        let mut new_state = state.clone();
+        new_state.previous_fee_bps = previous_fee;
+        new_state.current_fee_bps = new_fee;
+        new_state.ema_fee_bps = calculation.smoothed_fee_bps;
+        new_state.last_update = env.ledger().timestamp();
+        new_state.update_count += 1;
+
+        if let Some(demand) = demand_metrics {
+            new_state.demand_score = (demand.tx_count as i128 * 10).min(10000);
+        }
+
+        if let Some(supply) = supply_metrics {
+            new_state.supply_score = supply.utilization_bps;
+        }
+
+        env.storage().instance().set(&DataKey::PricingState, &new_state);
+
+        // Emit price update event
+        env.events().publish(
+            (PRICE_UPDATED,),
+            PriceUpdateEvent {
+                version: EVENT_VERSION_V2,
+                previous_fee_bps: previous_fee,
+                new_fee_bps: new_fee,
+                demand_score: new_state.demand_score,
+                supply_score: new_state.supply_score,
+                time_decay_factor: new_state.time_decay_factor,
+                oracle_price: oracle_data.map(|o| o.token_price),
+                timestamp: env.ledger().timestamp(),
+                reason: String::from_str(&env, "Scheduled price update"),
+            },
+        );
+    }
+
+    /// Get the current dynamic fee rate.
+    ///
+    /// Returns the current fee rate in basis points if dynamic pricing is enabled,
+    /// otherwise returns None.
+    pub fn get_dynamic_fee(env: Env) -> Option<i128> {
+        let config: Option<DynamicPricingConfig> = env.storage().instance().get(&DataKey::DynamicPricingConfig);
+        
+        if let Some(cfg) = config {
+            if cfg.enabled {
+                let state: Option<PricingState> = env.storage().instance().get(&DataKey::PricingState);
+                state.map(|s| s.current_fee_bps)
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    }
+
+    /// Get demand metrics.
+    pub fn get_demand_metrics(env: Env) -> Option<DemandMetrics> {
+        env.storage().instance().get(&DataKey::DemandMetrics)
+    }
+
+    /// Get supply metrics.
+    pub fn get_supply_metrics(env: Env) -> Option<SupplyMetrics> {
+        env.storage().instance().get(&DataKey::SupplyMetrics)
+    }
+
+    /// Get oracle data.
+    pub fn get_oracle_data(env: Env) -> Option<OracleMarketData> {
+        env.storage().instance().get(&DataKey::OracleData)
+    }
 }
 
 // #[cfg(test)]
@@ -7943,6 +8209,9 @@ impl ProgramEscrowContract {
 
 
 #[cfg(test)]
+mod test;
+mod test_pagination;
+mod test_dynamic_pricing;
 // mod test_pagination;
 // Pre-existing broken test modules excluded until their referenced types/methods are implemented:
 // #[cfg(test)] mod test_archival;
