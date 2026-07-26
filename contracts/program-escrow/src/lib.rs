@@ -674,10 +674,6 @@ pub enum ProgramStatus {
 /// contract.set_program_circuit_breaker_threshold(&program_id, &None);
 /// ```
 
-// schema_version: 2
-// Field ordering optimized for Soroban XDR write cost: fixed-size hot-path fields
-// come first so partial-update patterns touch the smallest possible XDR prefix.
-
 /// Configuration for fee-on-transfer (FoT) token routing via an AMM router.
 ///
 /// When set, the contract queries the router for a quote before each payout
@@ -713,17 +709,6 @@ pub struct FotRouterClearedEvent {
     pub timestamp: u64,
 }
 
-/// Contract-type-safe optional wrapper around [`FotRouter`].
-///
-/// Nested `Option<FotRouter>` inside another `#[contracttype]` breaks under
-/// Cargo feature unification with `soroban-sdk/testutils` (unit-test builds).
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum OptionalFotRouter {
-    None,
-    Some(FotRouter),
-}
-
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ProgramData {
@@ -744,12 +729,12 @@ pub struct ProgramData {
     /// If set, overrides the global default (3) for this program.
     /// Must be between 1 and 100 inclusive when set.
     pub circuit_breaker_threshold: Option<u32>,
+    /// Optional FoT router configuration for fee-on-transfer token handling.
+    pub fot_router: Option<FotRouter>,
     // --- Cold path: variable-size fields written infrequently ---
     pub program_id: String,
     pub payout_history: soroban_sdk::Vec<PayoutRecord>,
     pub reference_hash: Option<soroban_sdk::Bytes>,
-    /// Optional FoT router used to preserve net payouts for fee-on-transfer tokens.
-    pub fot_router: OptionalFotRouter,
 }
 
 /// Program delegate audit record used for bulk reporting and indexer views.
@@ -1325,6 +1310,12 @@ pub enum DataKey {
     /// so programs with no payouts pay zero cold-storage cost.
     /// Stored in persistent storage so it survives TTL-based ledger pruning.
     RecipientPayoutIndex(String, Address),
+    /// Per-program lifecycle timeline: program_id → ProgramLifecycleTimeline.
+    ///
+    /// Stores an ordered list of status transitions (Draft → Active, etc.)
+    /// enabling dwell-time queries for ecosystem operators.
+    /// Written on each status change; read via get_program_lifecycle_timeline.
+    LifecycleTimeline(String),
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1513,6 +1504,53 @@ pub struct Analytics {
     pub total_payouts: u32,
     pub active_programs: u32,
     pub operation_count: u32,
+}
+
+/// A single recorded status transition within a program's lifecycle.
+///
+/// Each entry captures a transition from one [`ProgramStatus`] to another
+/// at a specific ledger timestamp, enabling off-chain computation of
+/// dwell times per status.
+///
+/// # Initial entry convention
+/// The first transition for every program records `from_status: Draft` and
+/// `to_status: Draft` — both sides are `Draft` because there is no special
+/// "Created" or "Null" variant in [`ProgramStatus`].  The timestamp of this
+/// entry marks the program's creation time.  Dwell time in Draft is computed
+/// as `transitions[1].timestamp - transitions[0].timestamp`.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StatusTransition {
+    /// The status the program is transitioning **from**.
+    ///
+    /// For the initial creation entry this is `ProgramStatus::Draft` (same
+    /// as `to_status`), indicating the program entered the lifecycle.
+    pub from_status: ProgramStatus,
+    /// The status the program is transitioning **to**.
+    pub to_status: ProgramStatus,
+    /// Ledger timestamp (seconds since Unix epoch) when the transition
+    /// was recorded.  Sourced from `env.ledger().timestamp()`, which is
+    /// deterministic across all Soroban validators.
+    pub timestamp: u64,
+}
+
+/// On-chain record of all status transitions for a single program.
+///
+/// Stored under `DataKey::LifecycleTimeline(program_id)` as a companion
+/// record alongside [`ProgramData`].  Because this is stored under its own
+/// key, adding it does not change the existing [`Analytics`] field ordering
+/// or [`ProgramData`] layout, preserving storage compatibility.
+///
+/// # Upgrade safety
+/// If a future version needs to store additional per-transition metadata
+/// (e.g. the caller address that triggered the transition), a new storage
+/// key version should be introduced.  This struct is append-only in the
+/// sense that new transitions are pushed to the end of the Vec.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProgramLifecycleTimeline {
+    /// Ordered list of status transitions (oldest first).
+    pub transitions: soroban_sdk::Vec<StatusTransition>,
 }
 
 /// Program reputation metrics tracking performance and reliability.
@@ -1944,6 +1982,8 @@ mod tests;
 mod test_maintenance_mode;
 mod test_risk_flags;
 mod test_struct_layout;
+#[cfg(test)]
+mod test_lifecycle_dwell_time;
 // #[cfg(test)] mod test_serialization_compatibility; // pre-existing breakage
 // #[cfg(test)] mod test_payout_splits; // pre-existing breakage
 
@@ -2381,6 +2421,14 @@ impl ProgramEscrowContract {
         let program_key = DataKey::Program(program_id.clone());
         env.storage().instance().set(&program_key, &program_data);
 
+        // Record the initial transition into Draft status
+        Self::record_status_transition(
+            &env,
+            &program_id,
+            &ProgramStatus::Draft,
+            &ProgramStatus::Draft,
+        );
+
         let mut registry: soroban_sdk::Vec<String> = env
             .storage()
             .instance()
@@ -2608,6 +2656,14 @@ impl ProgramEscrowContract {
         program_data.status = ProgramStatus::Active;
         Self::store_program_data(&env, &program_id, &program_data);
 
+        // Record the Draft → Active status transition
+        Self::record_status_transition(
+            &env,
+            &program_id,
+            &ProgramStatus::Draft,
+            &ProgramStatus::Active,
+        );
+
         // Emit ProgramPublished after the status write so indexers only see committed transitions.
         env.events().publish(
             (PROGRAM_PUBLISHED,),
@@ -2738,6 +2794,14 @@ impl ProgramEscrowContract {
             };
             let program_key = DataKey::Program(program_id.clone());
             env.storage().instance().set(&program_key, &program_data);
+
+            // Record the initial transition into Draft status for this program
+            Self::record_status_transition(
+                &env,
+                &program_id,
+                &ProgramStatus::Draft,
+                &ProgramStatus::Draft,
+            );
 
             if i == 0 {
                 let fee_config = FeeConfig {
@@ -3677,6 +3741,57 @@ impl ProgramEscrowContract {
         }
 
         panic!("Program not found");
+    }
+
+    /// Record a status transition in the program's lifecycle timeline.
+    ///
+    /// Appends a [`StatusTransition`] entry to the timeline stored under
+    /// `DataKey::LifecycleTimeline(program_id)`, creating the timeline
+    /// record if none exists yet.
+    ///
+    /// # Panics
+    /// Never panics on its own; storage operations succeed in the
+    /// current Soroban host environment.
+    fn record_status_transition(
+        env: &Env,
+        program_id: &String,
+        from_status: &ProgramStatus,
+        to_status: &ProgramStatus,
+    ) {
+        let timestamp = env.ledger().timestamp();
+        let transition = StatusTransition {
+            from_status: from_status.clone(),
+            to_status: to_status.clone(),
+            timestamp,
+        };
+        let key = DataKey::LifecycleTimeline(program_id.clone());
+        let mut timeline: ProgramLifecycleTimeline = env
+            .storage()
+            .instance()
+            .get(&key)
+            .unwrap_or(ProgramLifecycleTimeline {
+                transitions: Vec::new(env),
+            });
+        timeline.transitions.push_back(transition);
+        env.storage().instance().set(&key, &timeline);
+    }
+
+    /// Returns the full lifecycle timeline (ordered status transitions) for a program.
+    ///
+    /// # Arguments
+    /// * `program_id` — The program whose timeline to fetch.
+    ///
+    /// # Returns
+    /// A [`Vec<StatusTransition>`] with transitions ordered oldest-first.
+    /// Returns an empty Vec if no transitions have been recorded (e.g. legacy
+    /// programs created before this feature was deployed).
+    pub fn get_program_lifecycle_timeline(env: Env, program_id: String) -> soroban_sdk::Vec<StatusTransition> {
+        let key = DataKey::LifecycleTimeline(program_id);
+        env.storage()
+            .instance()
+            .get::<_, ProgramLifecycleTimeline>(&key)
+            .map(|t| t.transitions)
+            .unwrap_or_else(|| Vec::new(&env))
     }
 
     fn store_program_data(env: &Env, program_id: &String, program_data: &ProgramData) {
