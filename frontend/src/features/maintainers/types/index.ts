@@ -105,6 +105,26 @@ export interface PullRequest {
 
 export type PRFilterType = "All states" | "Open" | "Merged" | "Closed" | "Draft";
 
+/**
+ * A pull request that is linked to an issue, used by the PR-linking badge
+ * on IssueCard components.
+ */
+export interface LinkedPR {
+  id: number;
+  number: number;
+  title: string;
+  status: 'open' | 'merged' | 'closed' | 'draft';
+  /** Human-readable detail, e.g. "merged 2 days ago by JagadeeshFtw" */
+  statusDetail: string;
+  author: {
+    name: string;
+    /** GitHub avatar URL. Falls back to initials if absent or fails to load. */
+    avatar?: string;
+  };
+  /** Full GitHub PR URL for the "Open on GitHub" link. */
+  url?: string;
+}
+
 // Remove Waves from TabType
 export type TabType = "Dashboard" | "Issues" | "Pull Requests" | "Analytics";
 
