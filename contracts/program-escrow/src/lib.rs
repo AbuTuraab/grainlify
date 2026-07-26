@@ -150,6 +150,12 @@ mod errors;
 pub use errors::BatchPayoutError;
 use errors::ContractError;
 
+mod metadata;
+pub use metadata::{
+    CompressedCustomField, CompressedProgramMetadata, MetadataFieldKey,
+    try_decode_legacy_metadata,
+};
+
 mod dynamic_pricing;
 pub use dynamic_pricing::{
     DynamicPricingConfig, PricingState, PricingEngine, PricingError,
@@ -206,6 +212,8 @@ const ORACLE_DATA: Symbol = symbol_short!("OraclD");
 const PAYOUT_IDEM_KEYS: Symbol = symbol_short!("PayIdem");
 /// Event symbol emitted when a batch_payout replay is detected.
 const BATCH_PAYOUT_REPLAYED: Symbol = symbol_short!("BatPayRp");
+const EPOCH_SNAPSHOTS: Symbol = symbol_short!("EpSnap");
+const NEXT_EPOCH_ID: Symbol = symbol_short!("NxtEpID");
 
 // Fee rate is stored in basis points (1 basis point = 0.01%)
 // Example: 100 basis points = 1%, 1000 basis points = 10%
@@ -1251,6 +1259,9 @@ pub enum DataKey {
     SpendingState(String),
     ReadOnlyMode,
     Metadata(String),
+    /// Compressed metadata stored under `MetadataFieldKey` enum keys.
+    /// Read path falls back to `Metadata(String)` for backwards compatibility.
+    MetadataV2(String),
     RotationNonce(String),
     ReleaseTriggerSchemaVersion,
     ReentrancyGuard,
@@ -1588,6 +1599,14 @@ pub struct ProgramReleaseHistory {
 pub enum ReleaseType {
     Manual,
     Automatic,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EpochSnapshot {
+    pub created_at: u64,
+    pub created_by: Address,
+    pub schedules: soroban_sdk::Vec<ProgramReleaseSchedule>,
 }
 
 #[contracttype]
@@ -2699,9 +2718,16 @@ impl ProgramEscrowContract {
         );
 
         if let Some(ref pm) = metadata {
+            // Store in legacy format for existing readers.
             env.storage()
                 .instance()
                 .set(&DataKey::Metadata(program_data.program_id.clone()), pm);
+            // Store in compressed format for reduced storage cost.
+            let compressed = CompressedProgramMetadata::from_legacy(&env, pm);
+            env.storage().instance().set(
+                &DataKey::MetadataV2(program_data.program_id.clone()),
+                &compressed,
+            );
         }
 
         program_data
@@ -4187,9 +4213,16 @@ impl ProgramEscrowContract {
             DELEGATE_PERMISSION_UPDATE_META,
         );
 
+        // Store in legacy format for existing readers.
         env.storage()
             .instance()
             .set(&DataKey::Metadata(program_id.clone()), &metadata);
+        // Store in compressed format for reduced storage cost.
+        let compressed = CompressedProgramMetadata::from_legacy(&env, &metadata);
+        env.storage().instance().set(
+            &DataKey::MetadataV2(program_id.clone()),
+            &compressed,
+        );
 
         env.events().publish(
             (PROGRAM_METADATA_UPDATED, program_id.clone()),
@@ -6519,7 +6552,12 @@ impl ProgramEscrowContract {
         Self::get_idempotency_record(&env, &idempotency_key)
     }
 
-    /// Get program metadata stored separately under `DataKey::Metadata`.
+    /// Get program metadata.
+    ///
+    /// Attempts to read compressed metadata from `DataKey::MetadataV2` first
+    /// (decompressing on the fly).  Falls back to the legacy `DataKey::Metadata`
+    /// key for backwards compatibility with programs that stored metadata before
+    /// the compression upgrade.
     ///
     /// # Arguments
     /// * `program_id` - The program identifier
@@ -6527,6 +6565,14 @@ impl ProgramEscrowContract {
     /// # Returns
     /// `Some(ProgramMetadata)` if metadata has been set, `None` otherwise.
     pub fn get_program_metadata(env: Env, program_id: String) -> Option<ProgramMetadata> {
+        // Try compressed (V2) format first.
+        let v2_key = DataKey::MetadataV2(program_id.clone());
+        if env.storage().instance().has(&v2_key) {
+            let compressed: CompressedProgramMetadata =
+                env.storage().instance().get(&v2_key).unwrap();
+            return Some(compressed.into_legacy(&env));
+        }
+        // Fall back to legacy (V1) format.
         env.storage().instance().get(&DataKey::Metadata(program_id))
     }
 
@@ -6661,13 +6707,70 @@ impl ProgramEscrowContract {
         schedule
     }
 
-    /// Trigger all due schedules where `now >= release_timestamp`.
-    pub fn trigger_program_releases(env: Env) -> u32 {
-        Self::trigger_program_releases_internal(env, None)
+    /// Create an epoch snapshot of currently due schedules.
+    pub fn create_epoch_snapshot(env: Env) -> u64 {
+        Self::create_epoch_snapshot_internal(env, None)
     }
 
-    pub fn trigger_program_releases_by(env: Env, caller: Address) -> u32 {
-        Self::trigger_program_releases_internal(env, Some(caller))
+    pub fn create_epoch_snapshot_by(env: Env, caller: Address) -> u64 {
+        Self::create_epoch_snapshot_internal(env, Some(caller))
+    }
+
+    fn create_epoch_snapshot_internal(env: Env, caller: Option<Address>) -> u64 {
+        let program_data: ProgramData = env
+            .storage()
+            .instance()
+            .get(&PROGRAM_DATA)
+            .unwrap_or_else(|| panic!("Program not initialized"));
+
+        Self::authorize_release_actor(&env, &program_data, caller.as_ref());
+
+        let schedules: soroban_sdk::Vec<ProgramReleaseSchedule> = env
+            .storage()
+            .instance()
+            .get(&SCHEDULES)
+            .unwrap_or_else(|| Vec::new(&env));
+
+        let now = env.ledger().timestamp();
+        let mut due_schedules: soroban_sdk::Vec<ProgramReleaseSchedule> = Vec::new(&env);
+        
+        for i in 0..schedules.len() {
+            let s = schedules.get(i).unwrap();
+            if !s.released && now >= s.release_timestamp {
+                due_schedules.push_back(s);
+            }
+        }
+
+        let mut next_epoch_id: u64 = env.storage().instance().get(&NEXT_EPOCH_ID).unwrap_or(1);
+        let current_epoch_id = next_epoch_id;
+        next_epoch_id += 1;
+        env.storage().instance().set(&NEXT_EPOCH_ID, &next_epoch_id);
+
+        let snapshot = EpochSnapshot {
+            created_at: now,
+            created_by: caller.unwrap_or_else(|| env.current_contract_address()),
+            schedules: due_schedules,
+        };
+
+        let mut snapshots: soroban_sdk::Map<u64, EpochSnapshot> = env
+            .storage()
+            .instance()
+            .get(&EPOCH_SNAPSHOTS)
+            .unwrap_or_else(|| soroban_sdk::Map::new(&env));
+        
+        snapshots.set(current_epoch_id, snapshot);
+        env.storage().instance().set(&EPOCH_SNAPSHOTS, &snapshots);
+
+        current_epoch_id
+    }
+
+    /// Trigger all due schedules where `now >= release_timestamp`.
+    pub fn trigger_program_releases(env: Env, epoch_id: Option<u64>) -> u32 {
+        Self::trigger_program_releases_internal(env, None, epoch_id)
+    }
+
+    pub fn trigger_program_releases_by(env: Env, caller: Address, epoch_id: Option<u64>) -> u32 {
+        Self::trigger_program_releases_internal(env, Some(caller), epoch_id)
     }
 
     /// Internal implementation for trigger_program_releases.
@@ -6686,7 +6789,7 @@ impl ProgramEscrowContract {
     /// - Uses ReleaseTriggerSchemaVersion for backward compatibility
     /// - Gracefully handles schema migrations
     /// - Preserves payout history and schedule state across upgrades
-    fn trigger_program_releases_internal(env: Env, caller: Option<Address>) -> u32 {
+    fn trigger_program_releases_internal(env: Env, caller: Option<Address>, epoch_id: Option<u64>) -> u32 {
         reentrancy_guard::acquire(&env);
 
         let mut program_data: ProgramData = env
@@ -6724,60 +6827,115 @@ impl ProgramEscrowContract {
         // Deterministic ordering: build a sorted index of due, unreleased schedules
         // sorted ascending by schedule_id so output is replay-identical across nodes.
         let len = schedules.len();
-        let mut due_indices: soroban_sdk::Vec<u32> = Vec::new(&env);
-        for i in 0..len {
-            let s = schedules.get(i).unwrap();
-            if !s.released && now >= s.release_timestamp {
-                // Insert-sort by schedule_id (ascending) for determinism
-                let mut inserted = false;
-                for j in 0..due_indices.len() {
-                    let idx = due_indices.get(j).unwrap();
-                    let existing = schedules.get(idx).unwrap();
-                    if s.schedule_id < existing.schedule_id {
-                        due_indices = Self::vec_insert_at(&env, due_indices, j, i);
-                        inserted = true;
-                        break;
+        
+        let mut snapshot_schedules: Option<soroban_sdk::Vec<ProgramReleaseSchedule>> = None;
+        if let Some(eid) = epoch_id {
+            let snapshots: soroban_sdk::Map<u64, EpochSnapshot> = env
+                .storage()
+                .instance()
+                .get(&EPOCH_SNAPSHOTS)
+                .unwrap_or_else(|| panic!("Epoch snapshots map not found"));
+            let snapshot = snapshots.get(eid).unwrap_or_else(|| panic!("Epoch snapshot not found"));
+            snapshot_schedules = Some(snapshot.schedules);
+        }
+
+        // store a tuple of (main_schedule_index, snap_schedule_index) where u32::MAX means no snap schedule
+        let mut due_entries: soroban_sdk::Vec<u64> = Vec::new(&env);
+        // Pack (main_index, snap_index) into a single u64 for easier use with vec_insert_at if needed, but let's just use two u32s encoded as u64
+        // High 32 bits = main_index, Low 32 bits = snap_index
+        
+        if let Some(ref snap_scheds) = snapshot_schedules {
+            let snap_len = snap_scheds.len();
+            for snap_i in 0..snap_len {
+                let s = snap_scheds.get(snap_i).unwrap();
+                // Find matching schedule_id in main schedules
+                for i in 0..len {
+                    let existing = schedules.get(i).unwrap();
+                    if existing.schedule_id == s.schedule_id && !existing.released {
+                        // Insert-sort by schedule_id (ascending)
+                        let mut inserted = false;
+                        for j in 0..due_entries.len() {
+                            let entry_packed = due_entries.get(j).unwrap();
+                            let existing_in_list = schedules.get((entry_packed >> 32) as u32).unwrap();
+                            if existing.schedule_id < existing_in_list.schedule_id {
+                                let packed = ((i as u64) << 32) | (snap_i as u64);
+                                due_entries = Self::vec_insert_at_u64(&env, due_entries, j, packed);
+                                inserted = true;
+                                break;
+                            }
+                        }
+                        if !inserted {
+                            due_entries.push_back(((i as u64) << 32) | (snap_i as u64));
+                        }
+                        break; // Move to next snap schedule
                     }
                 }
-                if !inserted {
-                    due_indices.push_back(i);
+            }
+        } else {
+            for i in 0..len {
+                let s = schedules.get(i).unwrap();
+                if !s.released && now >= s.release_timestamp {
+                    // Insert-sort by schedule_id (ascending) for determinism
+                    let mut inserted = false;
+                    for j in 0..due_entries.len() {
+                        let entry_packed = due_entries.get(j).unwrap();
+                        let existing_in_list = schedules.get((entry_packed >> 32) as u32).unwrap();
+                        if s.schedule_id < existing_in_list.schedule_id {
+                            let packed = ((i as u64) << 32) | (u32::MAX as u64);
+                            due_entries = Self::vec_insert_at_u64(&env, due_entries, j, packed);
+                            inserted = true;
+                            break;
+                        }
+                    }
+                    if !inserted {
+                        due_entries.push_back(((i as u64) << 32) | (u32::MAX as u64));
+                    }
                 }
             }
         }
 
         // Process due schedules in sorted order; skip (don't panic) on insufficient balance
-        for k in 0..due_indices.len() {
-            let i = due_indices.get(k).unwrap();
+        for k in 0..due_entries.len() {
+            let entry_packed = due_entries.get(k).unwrap();
+            let i = (entry_packed >> 32) as u32;
+            let snap_i = (entry_packed & 0xFFFFFFFF) as u32;
             let mut schedule = schedules.get(i).unwrap();
 
+            let (exec_amount, exec_recipient) = if snap_i != u32::MAX {
+                let s = snapshot_schedules.as_ref().unwrap().get(snap_i).unwrap();
+                (s.amount, s.recipient.clone())
+            } else {
+                (schedule.amount, schedule.recipient.clone())
+            };
+
             // Skip schedule if contract has insufficient balance — deferred to next trigger
-            if schedule.amount > program_data.remaining_balance {
+            if exec_amount > program_data.remaining_balance {
                 skipped_count += 1;
                 continue;
             }
 
             // Effects before interaction (CEI pattern)
-            program_data.remaining_balance -= schedule.amount;
+            program_data.remaining_balance -= exec_amount;
             schedule.released = true;
             schedule.released_at = Some(now);
             schedule.released_by = Some(contract_address.clone());
             schedules.set(i, schedule.clone());
 
             program_data.payout_history.push_back(PayoutRecord {
-                recipient: schedule.recipient.clone(),
-                amount: schedule.amount,
+                recipient: exec_recipient.clone(),
+                amount: exec_amount,
                 timestamp: now,
             });
             release_history.push_back(ProgramReleaseHistory {
                 schedule_id: schedule.schedule_id,
-                recipient: schedule.recipient.clone(),
-                amount: schedule.amount,
+                recipient: exec_recipient.clone(),
+                amount: exec_amount,
                 released_at: now,
                 release_type: ReleaseType::Automatic,
             });
 
             // Interaction: token transfer (after state updates)
-            token_client.transfer(&contract_address, &schedule.recipient, &schedule.amount);
+            token_client.transfer(&contract_address, &exec_recipient, &exec_amount);
 
             // Emit per-schedule event
             env.events().publish(
@@ -6786,8 +6944,8 @@ impl ProgramEscrowContract {
                     version: EVENT_VERSION_V2,
                     program_id: program_data.program_id.clone(),
                     schedule_id: schedule.schedule_id,
-                    recipient: schedule.recipient,
-                    amount: schedule.amount,
+                    recipient: exec_recipient,
+                    amount: exec_amount,
                     released_at: now,
                     released_by: contract_address.clone(),
                 },
@@ -6828,6 +6986,25 @@ impl ProgramEscrowContract {
         value: u32,
     ) -> soroban_sdk::Vec<u32> {
         let mut result: soroban_sdk::Vec<u32> = Vec::new(env);
+        for i in 0..v.len() {
+            if i == pos {
+                result.push_back(value);
+            }
+            result.push_back(v.get(i).unwrap());
+        }
+        if pos >= v.len() {
+            result.push_back(value);
+        }
+        result
+    }
+
+    fn vec_insert_at_u64(
+        env: &Env,
+        v: soroban_sdk::Vec<u64>,
+        pos: u32,
+        value: u64,
+    ) -> soroban_sdk::Vec<u64> {
+        let mut result: soroban_sdk::Vec<u64> = Vec::new(env);
         for i in 0..v.len() {
             if i == pos {
                 result.push_back(value);
