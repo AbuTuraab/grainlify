@@ -1,4 +1,4 @@
-//! # Batch Performance Benchmarks — Program Escrow
+//! # Batch Performance Benchmarks — Program Escrow & Bounty Escrow
 //!
 //! ## USAGE
 //!
@@ -15,6 +15,11 @@
 //!     include!("../../benchmarks/batch_performance.rs");
 //! }
 //! ```
+//! 
+//! *Note: For `bounty_escrow` benchmarks comparing AoS and SoA implementations,
+//! refer to `contracts/bounty_escrow/contracts/escrow/src/test_batch_soa_benchmark.rs`.
+//! Structure-of-Arrays (SoA) layout significantly reduces host-to-guest
+//! deserialization overhead in Soroban compared to Array-of-Structs (AoS).*
 //!
 //! Then run:
 //!

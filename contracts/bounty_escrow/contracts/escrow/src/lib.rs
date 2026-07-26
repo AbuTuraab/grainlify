@@ -28,6 +28,9 @@ mod test_filter_pagination;
 #[cfg(test)]
 mod test_reentrancy_guard;
 // #[cfg(test)] mod test_admin_rotation; // pre-existing SDK/API drift blocks filtered test builds
+#[cfg(test)]
+mod test_batch_soa_benchmark;
+
 
 use crate::events::{
     emit_admin_rotation_accepted, emit_admin_rotation_cancelled, emit_admin_rotation_proposed,
@@ -7086,6 +7089,35 @@ impl BountyEscrowContract {
         Self::batch_lock_funds(env, items)
     }
 
+    /// Structure-of-Arrays (SoA) variant of `batch_lock_funds`.
+    /// Reduces host-to-guest deserialization overhead by accepting parallel arrays
+    /// of primitives instead of an array of structs.
+    pub fn batch_lock_funds_soa(
+        env: Env,
+        bounty_ids: Vec<u64>,
+        depositors: Vec<Address>,
+        amounts: Vec<i128>,
+        deadlines: Vec<u64>,
+    ) -> Result<u32, Error> {
+        if bounty_ids.len() != depositors.len()
+            || bounty_ids.len() != amounts.len()
+            || bounty_ids.len() != deadlines.len()
+        {
+            return Err(Error::BatchSizeMismatch);
+        }
+
+        let mut items = Vec::new(&env);
+        for i in 0..bounty_ids.len() {
+            items.push_back(LockFundsItem {
+                bounty_id: bounty_ids.get(i).unwrap(),
+                depositor: depositors.get(i).unwrap(),
+                amount: amounts.get(i).unwrap(),
+                deadline: deadlines.get(i).unwrap(),
+            });
+        }
+        Self::batch_lock_funds(env, items)
+    }
+
     /// Batch release funds to multiple contributors in a single atomic transaction.
     ///
     /// Releases between 1 and [`MAX_BATCH_SIZE`] bounties in one admin-authorised
@@ -7285,6 +7317,28 @@ impl BountyEscrowContract {
         let count = result?;
         reentrancy_guard::release(&env);
         Ok(count)
+    }
+
+    /// Structure-of-Arrays (SoA) variant of `batch_release_funds`.
+    /// Reduces host-to-guest deserialization overhead by accepting parallel arrays
+    /// of primitives instead of an array of structs.
+    pub fn batch_release_funds_soa(
+        env: Env,
+        bounty_ids: Vec<u64>,
+        contributors: Vec<Address>,
+    ) -> Result<u32, Error> {
+        if bounty_ids.len() != contributors.len() {
+            return Err(Error::BatchSizeMismatch);
+        }
+
+        let mut items = Vec::new(&env);
+        for i in 0..bounty_ids.len() {
+            items.push_back(ReleaseFundsItem {
+                bounty_id: bounty_ids.get(i).unwrap(),
+                contributor: contributors.get(i).unwrap(),
+            });
+        }
+        Self::batch_release_funds(env, items)
     }
 
     // ============================================================================
