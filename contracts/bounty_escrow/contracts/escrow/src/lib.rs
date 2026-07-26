@@ -137,6 +137,13 @@ mod monitoring {
         pub contract_version: String,
     }
     // Data: Analytics
+    /// Internal monitoring analytics.
+    ///
+    /// **WARNING: Naming Collision**
+    /// This `Analytics` struct tracks operational metrics (`operation_count`, `unique_users`, etc.)
+    /// and is completely incompatible with the top-level `Analytics` struct found in `program-escrow` 
+    /// (which tracks financial totals like `total_locked`). 
+    /// SDK authors and indexers must not conflate the two.
     #[contracttype]
     #[derive(Clone, Debug)]
     pub struct Analytics {

@@ -336,6 +336,13 @@ mod monitoring {
     }
 
     // Data: Analytics
+    /// Internal monitoring analytics.
+    ///
+    /// **WARNING: Naming Collision**
+    /// This `Analytics` struct tracks operational metrics (`operation_count`, `unique_users`, etc.)
+    /// and is completely incompatible with the top-level `Analytics` struct (which tracks
+    /// financial totals like `total_locked`). 
+    /// SDK authors and indexers must not conflate the two.
     #[contracttype]
     #[derive(Clone, Debug)]
     pub struct Analytics {
@@ -1465,6 +1472,14 @@ pub struct HistoryPaginationConfig {
 /// detect schema mismatches on legacy deployments.
 pub const PAGINATION_SCHEMA_VERSION_V1: u32 = 1;
 
+/// Top-level analytics for the program escrow.
+/// 
+/// **WARNING: Naming Collision**
+/// This `Analytics` struct tracks financial metrics (`total_locked`, `total_released`, etc.) 
+/// and is completely incompatible with the `Analytics` struct defined in the internal 
+/// `monitoring` module (which tracks `operation_count`, `unique_users`, etc.). 
+/// SDK authors and indexers must not conflate the two.
+/// (Consider using an alias like `EscrowAnalytics` in off-chain code to avoid confusion).
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Analytics {
@@ -8237,3 +8252,15 @@ mod test_rbac;
 #[path = "release_schedule_host.rs"]
 mod release_schedule_host;
 
+#[cfg(test)]
+mod test_analytics_disambiguation {
+    use super::{Analytics, monitoring};
+    
+    #[test]
+    fn test_analytics_schemas_are_different() {
+        assert!(
+            core::mem::size_of::<Analytics>() != core::mem::size_of::<monitoring::Analytics>(),
+            "The top-level Analytics and monitoring::Analytics schemas must remain structurally distinct to avoid masking the naming collision"
+        );
+    }
+}
