@@ -22,11 +22,11 @@ pub fn apply_fot_router(
     env: &Env,
     token_address: &Address,
     net_amount: i128,
-    fot_router: &Option<crate::FotRouter>,
+    fot_router: &crate::OptionalFotRouter,
 ) -> i128 {
     let router = match fot_router {
-        Some(r) => r,
-        None => return net_amount,
+        crate::OptionalFotRouter::Some(r) => r,
+        crate::OptionalFotRouter::None => return net_amount,
     };
 
     if net_amount <= 0 {

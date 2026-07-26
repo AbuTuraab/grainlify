@@ -6,3 +6,4 @@ export { GlassDropdown } from "./GlassDropdown";
 export { NotificationsDropdown } from "./NotificationsDropdown";
 export { EmptyState } from "./EmptyState";
 export type { EmptyStateProps, EmptyStateVariant } from "./EmptyState";
+export { SessionTimeoutBanner } from "./SessionTimeoutBanner";
