@@ -674,6 +674,10 @@ pub enum ProgramStatus {
 /// contract.set_program_circuit_breaker_threshold(&program_id, &None);
 /// ```
 
+// schema_version: 2
+// Field ordering optimized for Soroban XDR write cost: fixed-size hot-path fields
+// come first so partial-update patterns touch the smallest possible XDR prefix.
+
 /// Configuration for fee-on-transfer (FoT) token routing via an AMM router.
 ///
 /// When set, the contract queries the router for a quote before each payout
@@ -728,9 +732,7 @@ pub struct ProgramData {
     /// Optional per-program circuit breaker failure threshold.
     /// If set, overrides the global default (3) for this program.
     /// Must be between 1 and 100 inclusive when set.
-    pub circuit_breaker_threshold: Option<u32>,
-    /// Optional FoT router configuration for fee-on-transfer token handling.
-    pub fot_router: Option<FotRouter>,
+    pub circuit_breaker_threshold: Option<u8>,
     // --- Cold path: variable-size fields written infrequently ---
     pub program_id: String,
     pub payout_history: soroban_sdk::Vec<PayoutRecord>,
@@ -1558,8 +1560,10 @@ pub struct ProgramLifecycleTimeline {
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ProgramReputation {
-    /// Total number of direct payouts executed
+    /// Total number of payout records in history (includes dust; not used in `overall_score_bps`)
     pub total_payouts: u32,
+    /// Payouts with amount >= [`REPUTATION_MIN_QUALIFYING_PAYOUT_AMOUNT`]
+    pub qualified_payout_count: u32,
     /// Total number of release schedules created
     pub total_scheduled: u32,
     /// Number of schedules successfully released
@@ -1580,10 +1584,13 @@ pub struct ProgramReputation {
     /// Defaults to 10_000 if no schedules exist
     pub completion_rate_bps: u32,
     /// Payout fulfillment rate: (total_funds_distributed / total_funds_locked) * 10_000
-    /// Defaults to 0 if no funds locked, capped at 10_000
+    /// Defaults to 0 if no funds locked, capped at 10_000.
+    /// Value-weighted: dust payouts contribute proportionally to their size, not per-call.
     pub payout_fulfillment_rate_bps: u32,
     /// Overall reputation score in basis points (0-10_000)
-    /// Returns 0 if any overdue releases exist (reputation penalty for overdue milestones)
+    /// Weighted 60% schedule completion + 40% payout fulfillment.
+    /// Returns 0 if any overdue releases exist (reputation penalty for overdue milestones).
+    /// Resistant to dust spam on score: inflating `total_payouts` alone does not raise this field.
     pub overall_score_bps: u32,
 }
 
@@ -1962,11 +1969,19 @@ mod test_circuit_breaker_enforcement;
 mod fot_routing;
 mod threshold_monitor;
 mod token_math;
+mod reputation;
+pub use reputation::{
+    REPUTATION_DUST_PAYOUT_AMOUNT, REPUTATION_MIN_QUALIFYING_PAYOUT_AMOUNT,
+    REPUTATION_TYPICAL_PAYOUT_AMOUNT,
+};
 
 // #[cfg(test)] mod reentrancy_guard_standalone_test; // pre-existing breakage
 // #[cfg(test)] mod malicious_reentrant; // pre-existing breakage
 #[cfg(test)]
 mod test_granular_pause;
+
+#[cfg(test)]
+mod test_reputation;
 
 // ========================================================================
 // Property-based test suite — `src/tests/` submodule hierarchy
@@ -5173,9 +5188,11 @@ impl ProgramEscrowContract {
             }
         }
 
-        let previous_threshold = program_data.circuit_breaker_threshold;
+        let previous_threshold = program_data
+            .circuit_breaker_threshold
+            .map(|value| value as u32);
         let mut updated_data = program_data.clone();
-        updated_data.circuit_breaker_threshold = threshold;
+        updated_data.circuit_breaker_threshold = threshold.map(|value| value as u8);
 
         // Update program data
         let program_key = DataKey::Program(program_id.clone());
@@ -7821,8 +7838,11 @@ impl ProgramEscrowContract {
     }
 
     /// Get reputation metrics for the current program.
-    /// Computes reputation based on schedules, payouts, and funds.
-    /// Returns zero overall_score_bps if any releases are overdue (penalty for missed milestones).
+    ///
+    /// Computes reputation from schedules, payout **amounts**, and locked funds.
+    /// `overall_score_bps` is value-weighted; dust-sized payouts cannot cheaply max the score
+    /// while most funds stay locked. See `docs/program-escrow-reputation-gaming.md`.
+    /// Returns zero `overall_score_bps` if any releases are overdue (missed milestone penalty).
     pub fn get_program_reputation(env: Env) -> ProgramReputation {
         let program_data: Option<ProgramData> = env.storage().instance().get(&PROGRAM_DATA);
 
@@ -7830,6 +7850,7 @@ impl ProgramEscrowContract {
             // Return zero reputation for uninitialized program
             return ProgramReputation {
                 total_payouts: 0,
+                qualified_payout_count: 0,
                 total_scheduled: 0,
                 completed_releases: 0,
                 pending_releases: 0,
@@ -7873,48 +7894,35 @@ impl ProgramEscrowContract {
             }
         }
 
-        // Compute distributed funds from payout history
+        // Compute distributed funds and qualifying activity from payout history
         let mut total_funds_distributed: i128 = 0;
+        let mut qualified_payout_count: u32 = 0;
         for payout in program_data.payout_history.iter() {
-            total_funds_distributed = total_funds_distributed.saturating_add(payout.amount);
+            total_funds_distributed =
+                total_funds_distributed.saturating_add(payout.amount);
+            if payout.amount >= reputation::REPUTATION_MIN_QUALIFYING_PAYOUT_AMOUNT {
+                qualified_payout_count = qualified_payout_count.saturating_add(1);
+            }
         }
 
         let total_payouts = program_data.payout_history.len() as u32;
         let total_funds_locked = program_data.total_funds;
 
-        // Compute completion_rate_bps
-        let completion_rate_bps = if total_scheduled == 0 {
-            10_000 // Default to perfect if no schedules
-        } else {
-            let rate = (completed_releases as u64)
-                .saturating_mul(10_000)
-                .saturating_div(total_scheduled as u64);
-            (rate.min(10_000)) as u32
-        };
+        let completion_rate_bps =
+            reputation::completion_rate_bps(completed_releases, total_scheduled);
 
-        // Compute payout_fulfillment_rate_bps
-        let payout_fulfillment_rate_bps = if total_funds_locked == 0 {
-            10_000 // Default to perfect if no funds locked
-        } else {
-            let rate = total_funds_distributed
-                .saturating_mul(10_000)
-                .saturating_div(total_funds_locked);
-            (rate.min(10_000)) as u32
-        };
+        let payout_fulfillment_rate_bps =
+            reputation::payout_fulfillment_rate_bps(total_funds_distributed, total_funds_locked);
 
-        // Compute overall_score_bps: 0 if overdue releases exist, else weighted average
-        let overall_score_bps = if overdue_releases > 0 {
-            0 // Reputation penalty: any overdue release results in zero overall score
-        } else {
-            let weighted = (completion_rate_bps as u64)
-                .saturating_mul(60)
-                .saturating_add((payout_fulfillment_rate_bps as u64).saturating_mul(40))
-                .saturating_div(100);
-            (weighted.min(10_000)) as u32
-        };
+        let overall_score_bps = reputation::overall_score_bps(
+            completion_rate_bps,
+            payout_fulfillment_rate_bps,
+            overdue_releases,
+        );
 
         ProgramReputation {
             total_payouts,
+            qualified_payout_count,
             total_scheduled,
             completed_releases,
             pending_releases,
