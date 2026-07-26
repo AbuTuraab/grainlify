@@ -4,8 +4,10 @@ import { ExternalLink, Copy, Circle, ArrowLeft, GitPullRequest } from 'lucide-re
 import { useTheme } from '../../../shared/contexts/ThemeContext';
 import { getPublicProject, getPublicProjectIssues, getPublicProjectPRs } from '../../../shared/api/client';
 import { SkeletonLoader } from '../../../shared/components/SkeletonLoader';
+import { MediaEmbed } from '../../../shared/components/MediaEmbed';
 import ReactMarkdown from 'react-markdown';
 import { LanguageIcon } from '../../../shared/components/LanguageIcon';
+import { ProjectReleaseTimeline } from '../../ProjectDetailPage/ProjectReleaseTimeline';
 
 const InPreContext = createContext(false);
 
@@ -90,8 +92,35 @@ function OverviewMarkdown({ readme, theme }: { readme: string; theme: string }) 
             {...props}
           />
         ),
-        img: ({ ...props }) => (
-          <img className="rounded-[12px] max-w-full h-auto my-4" alt="" {...props} />
+        img: ({ src, alt, ...props }) => {
+          // Route animated GIFs through MediaEmbed for pause control + lazy-load
+          if (src && /\.gif(\?.*)?$/i.test(src)) {
+            return (
+              <MediaEmbed
+                src={src}
+                kind="gif"
+                title={alt || undefined}
+                className="my-4"
+              />
+            );
+          }
+          return (
+            <img
+              className="rounded-[12px] max-w-full h-auto my-4"
+              alt={alt || ''}
+              src={src}
+              {...props}
+            />
+          );
+        },
+        // Route <video> tags in README markdown through MediaEmbed
+        video: ({ src, poster, ...props }: React.VideoHTMLAttributes<HTMLVideoElement>) => (
+          <MediaEmbed
+            src={src || ''}
+            kind="video"
+            poster={poster}
+            className="my-4"
+          />
         ),
         strong: ({ ...props }) => (
           <strong className={`font-bold ${headingColor}`} {...props} />
@@ -102,6 +131,59 @@ function OverviewMarkdown({ readme, theme }: { readme: string; theme: string }) 
     </ReactMarkdown>
   );
 }
+
+const mockMilestones = [
+  {
+    schedule_id: 1,
+    recipient: "GBACKEND6SIONL73G5B22ZWR2L4I52U6VUYK2H2W6ZLZP5P457V2NND3X",
+    amount: 10000000000,
+    release_timestamp: Math.floor(Date.now() / 1000) - 30 * 24 * 60 * 60, // 30 days ago
+    released: true,
+    released_at: Math.floor(Date.now() / 1000) - 30 * 24 * 60 * 60,
+    released_by: "GAADMIN6SIONL73G5B22ZWR2L4I52U6VUYK2H2W6ZLZP5P457V2NND3X",
+    tx_hash: "29f3bc17e8894451000a6e5b922a9cf2996944e88f58b022204c3cf7b2b2df66"
+  },
+  {
+    schedule_id: 2,
+    recipient: "GBACKEND6SIONL73G5B22ZWR2L4I52U6VUYK2H2W6ZLZP5P457V2NND3X",
+    amount: 25000000000,
+    release_timestamp: Math.floor(Date.now() / 1000) - 20 * 24 * 60 * 60, // 20 days ago
+    released: false,
+    released_at: null,
+    released_by: null,
+    tx_hash: null
+  },
+  {
+    schedule_id: 3,
+    recipient: "GBACKEND6SIONL73G5B22ZWR2L4I52U6VUYK2H2W6ZLZP5P457V2NND3X",
+    amount: 50000000000,
+    release_timestamp: Math.floor(Date.now() / 1000) - 10 * 24 * 60 * 60, // 10 days ago
+    released: true,
+    released_at: Math.floor(Date.now() / 1000) - 10 * 24 * 60 * 60,
+    released_by: "GAADMIN6SIONL73G5B22ZWR2L4I52U6VUYK2H2W6ZLZP5P457V2NND3X",
+    tx_hash: "7fbc8d6b99de02fe38a6a68f0003cba2f1f58b88fc5863c3ef8a6c8e3cf349b1"
+  },
+  {
+    schedule_id: 4,
+    recipient: "GBACKEND6SIONL73G5B22ZWR2L4I52U6VUYK2H2W6ZLZP5P457V2NND3X",
+    amount: 15000000000,
+    release_timestamp: Math.floor(Date.now() / 1000) - 1 * 24 * 60 * 60, // 1 day ago
+    released: false,
+    released_at: null,
+    released_by: null,
+    tx_hash: null
+  },
+  {
+    schedule_id: 5,
+    recipient: "GBACKEND6SIONL73G5B22ZWR2L4I52U6VUYK2H2W6ZLZP5P457V2NND3X",
+    amount: 30000000000,
+    release_timestamp: Math.floor(Date.now() / 1000) + 15 * 24 * 60 * 60, // 15 days in future
+    released: false,
+    released_at: null,
+    released_by: null,
+    tx_hash: null
+  }
+];
 
 export function ProjectDetailPage({ onBack, onIssueClick, projectId: propProjectId, onClose, backLabel }: ProjectDetailPageProps) {
   const { theme } = useTheme();
@@ -735,6 +817,11 @@ export function ProjectDetailPage({ onBack, onIssueClick, projectId: propProject
             </div>
           </div>
         </div>
+
+        {/* Milestone Release Schedule Timeline */}
+        {!isLoading && (
+          <ProjectReleaseTimeline milestones={mockMilestones} />
+        )}
 
         {/* Overview */}
         <div className={`backdrop-blur-[40px] rounded-[24px] border p-8 transition-colors ${

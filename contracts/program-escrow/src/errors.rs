@@ -25,6 +25,9 @@
 
 use soroban_sdk::Error as SorobanError;
 
+/// Stable error code returned when a Draft program is used for Active-only operations.
+pub const ERR_PROGRAM_NOT_ACTIVE: u32 = ContractError::ProgramNotActive as u32;
+
 /// Canonical error enum for all public program-escrow entrypoints.
 ///
 /// This enum consolidates all possible errors that can be returned by the
@@ -774,9 +777,10 @@ impl BatchPayoutError {
             BatchPayoutError::InsufficientBalance => "Insufficient balance",
             BatchPayoutError::CircuitBreakerOpen => "Circuit breaker is OPEN",
             BatchPayoutError::DuplicateRecipient => "Duplicate recipient in batch",
-            BatchPayoutError::FeeConsumesAmount => "Payout fee consumes entire payout",
+BatchPayoutError::FeeConsumesAmount => "Payout fee consumes entire payout",
         }
     }
+}
 
 impl ContractError {
     /// Returns a human-readable description of the error.
@@ -919,6 +923,9 @@ impl ContractError {
                 "Token is not on the allowlist and cannot be removed"
             }
 
+            // FoT Router Errors
+            ContractError::FotRoutingFailed => "FoT routing failed",
+
             // Role Management Errors
             ContractError::AdminRotationInProgress => "Admin rotation already in progress",
             ContractError::NoAdminRotationInProgress => "No admin rotation in progress",
@@ -932,6 +939,7 @@ impl ContractError {
             ContractError::InvalidRoleProposal => "Invalid role proposal",
             ContractError::RoleRotationNotAllowed => "Role rotation not allowed",
 
+            ContractError::RotationTimelockActive => "Role rotation timelock is active",
             // Release Trigger / Schedule Errors
             ContractError::ReleaseTriggerFailed => "Release trigger failed",
             ContractError::NoSchedulesDue => "No schedules are due for release",
