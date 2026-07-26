@@ -5,6 +5,7 @@ import { LandingPage } from "../features/landing";
 import { SignInPage, SignUpPage, AuthCallbackPage } from "../features/auth";
 import { Dashboard } from "../features/dashboard";
 import Toast from "../shared/components/Toast";
+import { SessionTimeoutBanner } from "../shared/components/SessionTimeoutBanner";
 
 function ProtectedRoute({ children }: { children: JSX.Element }) {
   const { isAuthenticated, isLoading } = useAuth();
@@ -24,6 +25,7 @@ export default function App() {
       <ThemeProvider>
         <AuthProvider>
           <div className="overflow-x-hidden">
+            <SessionTimeoutBanner />
             <Routes>
               <Route path="/" element={<LandingPage />} />
               <Route path="/signin" element={<SignInPage />} />
