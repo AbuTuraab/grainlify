@@ -42,12 +42,25 @@ pub enum ContractError {
     SnapshotRestoreAdminPending = 106,
     /// Snapshot was pruned and is no longer available
     SnapshotPruned = 107,
+    /// Pagination parameters are invalid (offset > total or limit = 0)
+    InvalidPagination = 108,
 }
 pub const STORAGE_SCHEMA_VERSION: u32 = 1;
 pub const LIVENESS_SCHEMA_VERSION: u32 = 1;
 /// Version stamp embedded in every event struct for cross-version compatibility checks.
 pub const EVENT_SCHEMA_VERSION: u32 = 1;
-const CONFIG_SNAPSHOT_LIMIT: u32 = 20;
+
+/// Maximum number of retained `CoreConfigSnapshot` entries.
+///
+/// Without this cap, `list_config_snapshots` CPU cost grows linearly with the
+/// number of snapshots accumulated over a long-lived deployment. Automatic
+/// rotation on `create_config_snapshot` and explicit `prune_old_snapshots`
+/// keep storage and listing cost bounded.
+///
+/// **Tradeoff:** A lower limit reduces listing/storage cost but shortens
+/// rollback history depth. Prefer creating a snapshot immediately before a
+/// sensitive config change so the known-good state stays within the window.
+pub const CONFIG_SNAPSHOT_LIMIT: u32 = 20;
 
 /// Maximum number of deployed contracts that can be registered.
 /// Prevents unbounded storage growth and ensures predictable gas costs.
@@ -1268,6 +1281,19 @@ impl GrainlifyContract {
     // Config Snapshots
     // ========================================================================
 
+    /// Capture the current admin/version/multisig configuration into a new
+    /// `CoreConfigSnapshot`.
+    ///
+    /// # Authorization
+    /// Requires the current admin.
+    ///
+    /// # Retention
+    /// Retained snapshot count is capped at [`CONFIG_SNAPSHOT_LIMIT`]. When the
+    /// limit is exceeded the oldest snapshot is removed automatically (FIFO).
+    /// Use [`Self::prune_old_snapshots`] to shrink the window further.
+    ///
+    /// # Security
+    /// Blocked in read-only mode. Snapshot IDs are monotonic and never reused.
     pub fn create_config_snapshot(env: Env) -> u64 {
         let admin: Address = env.storage().instance().get(&DataKey::Admin).expect("Admin not set");
         admin.require_auth();
@@ -1298,13 +1324,8 @@ impl GrainlifyContract {
             .get(&DataKey::SnapshotIndex).unwrap_or(Vec::new(&env));
         index.push_back(next_id);
 
-        if index.len() > CONFIG_SNAPSHOT_LIMIT {
-            let oldest_snapshot_id = index.get(0).unwrap();
-            env.storage().instance().remove(&DataKey::ConfigSnapshot(oldest_snapshot_id));
-            let mut trimmed = Vec::new(&env);
-            for i in 1..index.len() { trimmed.push_back(index.get(i).unwrap()); }
-            index = trimmed;
-        }
+        // Auto-rotate when retention limit is exceeded.
+        Self::trim_snapshot_index_to(&env, &mut index, CONFIG_SNAPSHOT_LIMIT);
 
         env.storage().instance().set(&DataKey::SnapshotIndex, &index);
         env.storage().instance().set(&DataKey::SnapshotCounter, &next_id);
@@ -1316,11 +1337,51 @@ impl GrainlifyContract {
         next_id
     }
 
-    pub fn list_config_snapshots(env: Env) -> Vec<CoreConfigSnapshot> {
+    /// List retained config snapshots with optional pagination.
+    ///
+    /// Mirrors `view-facade::list_contracts`: callers pass optional `offset`
+    /// and `limit` to bound result size and CPU cost. Prefer paginated reads
+    /// over [`Self::list_config_snapshots_all`] for indexer-style scans.
+    ///
+    /// # Arguments
+    /// * `offset` — Number of entries to skip from the oldest end (default: 0).
+    /// * `limit` — Maximum number of entries to return (default: remaining).
+    ///
+    /// # Errors
+    /// * [`ContractError::InvalidPagination`] — if `offset > total` or
+    ///   `limit` is explicitly `0`.
+    ///
+    /// # Note
+    /// Pure view — no authorization required.
+    pub fn list_config_snapshots(
+        env: Env,
+        offset: Option<u32>,
+        limit: Option<u32>,
+    ) -> Result<Vec<CoreConfigSnapshot>, ContractError> {
         let index: Vec<u64> = env.storage().instance()
             .get(&DataKey::SnapshotIndex).unwrap_or(Vec::new(&env));
+        let total = index.len();
+        let offset = offset.unwrap_or(0);
+
+        if offset > total {
+            return Err(ContractError::InvalidPagination);
+        }
+        // Explicit zero limit is invalid; `None` means "all remaining", which
+        // may be zero when the index is empty (return Ok(empty)).
+        let limit = match limit {
+            Some(0) => return Err(ContractError::InvalidPagination),
+            Some(l) => l,
+            None => total.saturating_sub(offset),
+        };
+
+        let end = if offset.saturating_add(limit) > total {
+            total
+        } else {
+            offset + limit
+        };
+
         let mut snapshots: Vec<CoreConfigSnapshot> = Vec::new(&env);
-        for i in 0..index.len() {
+        for i in offset..end {
             let snapshot_id = index.get(i).unwrap();
             if let Some(snapshot) = env.storage().instance()
                 .get::<DataKey, CoreConfigSnapshot>(&DataKey::ConfigSnapshot(snapshot_id))
@@ -1328,13 +1389,94 @@ impl GrainlifyContract {
                 snapshots.push_back(snapshot);
             }
         }
-        snapshots
+        Ok(snapshots)
     }
 
+    /// Return all retained config snapshots (legacy / small-N convenience).
+    ///
+    /// Equivalent to `list_config_snapshots(None, None)` but always succeeds.
+    /// For large retained sets prefer the paginated form to bound CPU cost.
+    ///
+    /// # Note
+    /// Pure view — no authorization required.
+    pub fn list_config_snapshots_all(env: Env) -> Vec<CoreConfigSnapshot> {
+        // `None, None` never yields InvalidPagination (empty index returns Ok([])).
+        Self::list_config_snapshots(env, None, None).unwrap()
+    }
+
+    /// Prune oldest snapshots, retaining at most `keep_count` most-recent entries.
+    ///
+    /// # Authorization
+    /// Requires the current admin. Blocked in read-only mode.
+    ///
+    /// # Arguments
+    /// * `keep_count` — Number of newest snapshots to retain. Capped at
+    ///   [`CONFIG_SNAPSHOT_LIMIT`]. Pass `0` to remove all retained snapshots.
+    ///
+    /// # Returns
+    /// Number of snapshots removed.
+    ///
+    /// # Tradeoff
+    /// Aggressive pruning frees storage and bounds listing cost, but permanently
+    /// destroys older rollback points. `get_config_snapshot` / `restore_config_snapshot`
+    /// for pruned IDs will fail; unrelated retained snapshots remain fully usable.
+    ///
+    /// # Security
+    /// Admin-gated mutation. Does not alter live config — only snapshot history.
+    pub fn prune_old_snapshots(env: Env, keep_count: u32) -> u32 {
+        let admin: Address = env.storage().instance().get(&DataKey::Admin).expect("Admin not set");
+        admin.require_auth();
+        Self::require_not_read_only(&env);
+
+        let keep = if keep_count > CONFIG_SNAPSHOT_LIMIT {
+            CONFIG_SNAPSHOT_LIMIT
+        } else {
+            keep_count
+        };
+
+        let mut index: Vec<u64> = env.storage().instance()
+            .get(&DataKey::SnapshotIndex).unwrap_or(Vec::new(&env));
+        let before = index.len();
+        Self::trim_snapshot_index_to(&env, &mut index, keep);
+        let pruned = before.saturating_sub(index.len());
+
+        env.storage().instance().set(&DataKey::SnapshotIndex, &index);
+
+        env.events().publish(
+            (symbol_short!("cfg_snap"), symbol_short!("prune")),
+            (pruned, keep, env.ledger().timestamp()),
+        );
+        pruned
+    }
+
+    /// Drop oldest index entries until `index.len() <= keep`.
+    /// Removes corresponding `ConfigSnapshot` storage slots.
+    fn trim_snapshot_index_to(env: &Env, index: &mut Vec<u64>, keep: u32) {
+        while index.len() > keep {
+            let oldest_snapshot_id = index.get(0).unwrap();
+            env.storage().instance().remove(&DataKey::ConfigSnapshot(oldest_snapshot_id));
+            let mut trimmed = Vec::new(env);
+            for i in 1..index.len() {
+                trimmed.push_back(index.get(i).unwrap());
+            }
+            *index = trimmed;
+        }
+    }
+
+    /// Retrieve a specific retained snapshot by id.
+    ///
+    /// Returns `None` when the id was never created or has been pruned.
+    ///
+    /// # Note
+    /// Pure view — no authorization required.
     pub fn get_config_snapshot(env: Env, snapshot_id: u64) -> Option<CoreConfigSnapshot> {
         env.storage().instance().get(&DataKey::ConfigSnapshot(snapshot_id))
     }
 
+    /// Return the most recently retained config snapshot, if any.
+    ///
+    /// # Note
+    /// Pure view — no authorization required.
     pub fn get_latest_config_snapshot(env: Env) -> Option<CoreConfigSnapshot> {
         let index: Vec<u64> = env.storage().instance()
             .get(&DataKey::SnapshotIndex).unwrap_or(Vec::new(&env));
@@ -1343,12 +1485,33 @@ impl GrainlifyContract {
         env.storage().instance().get(&DataKey::ConfigSnapshot(latest_id))
     }
 
+    /// Number of currently retained config snapshots (≤ [`CONFIG_SNAPSHOT_LIMIT`]).
+    ///
+    /// Useful for pagination calculations alongside [`Self::list_config_snapshots`].
+    ///
+    /// # Note
+    /// Pure view — no authorization required.
     pub fn get_snapshot_count(env: Env) -> u32 {
         let index: Vec<u64> = env.storage().instance()
             .get(&DataKey::SnapshotIndex).unwrap_or(Vec::new(&env));
         index.len()
     }
 
+    /// Hard retention ceiling for config snapshots.
+    ///
+    /// # Note
+    /// Pure view — no authorization required.
+    pub fn get_config_snapshot_limit(_env: Env) -> u32 {
+        CONFIG_SNAPSHOT_LIMIT
+    }
+
+    /// Diff two retained snapshots by id.
+    ///
+    /// Cost is O(1) with respect to total snapshot count — only the two
+    /// addressed entries are loaded. Panics if either id is missing/pruned.
+    ///
+    /// # Note
+    /// Pure view — no authorization required.
     pub fn compare_snapshots(env: Env, from_id: u64, to_id: u64) -> SnapshotDiff {
         let from: CoreConfigSnapshot = env.storage().instance()
             .get(&DataKey::ConfigSnapshot(from_id))
@@ -2152,3 +2315,7 @@ impl traits::UpgradeInterface for GrainlifyContract {
     }
 }
 mod test;
+
+#[cfg(test)]
+#[path = "test/state_snapshot_tests.rs"]
+mod state_snapshot_tests;
