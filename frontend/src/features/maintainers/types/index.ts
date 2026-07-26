@@ -106,7 +106,41 @@ export interface PullRequest {
 export type PRFilterType = "All states" | "Open" | "Merged" | "Closed" | "Draft";
 
 // Remove Waves from TabType
-export type TabType = "Dashboard" | "Issues" | "Pull Requests";
+export type TabType = "Dashboard" | "Issues" | "Pull Requests" | "Analytics";
+
+/** Analytics date-range filter periods */
+export type AnalyticsPeriod = "7d" | "30d" | "90d" | "all";
+
+/** One stage of the bounty conversion funnel */
+export interface FunnelStage {
+  name: string;
+  value: number;
+  fill: string;
+}
+
+/** Payout status values */
+export type PayoutStatus = "paid" | "pending" | "processing" | "failed";
+
+/** One row in the payout history table */
+export interface PayoutRecord {
+  id: string;
+  date: string;           // ISO 8601
+  contributor: string;    // GitHub username
+  avatarUrl?: string;
+  repository: string;     // "org/repo"
+  amount: number;         // in XLM
+  status: PayoutStatus;
+}
+
+/** One entry in the top-contributors module */
+export interface TopContributor {
+  rank: number;
+  username: string;
+  avatarUrl?: string;
+  totalEarned: number;    // in XLM
+  trend: "up" | "down" | "same";
+  trendValue: number;     // absolute rank delta
+}
 
 // Shared types
 export interface Repository {
