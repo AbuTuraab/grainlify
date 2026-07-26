@@ -57,7 +57,8 @@ pub fn init_program(ctx: &Ctx, program_id: &str, amount: i128) {
         &Some(amount),
         &None,
     );
-    ctx.client.publish_program(&prog_id, &creator);
+    // Publisher must be admin or authorized_payout_key (not an arbitrary creator).
+    ctx.client.publish_program(&prog_id, &ctx.admin);
 }
 
 #[test]
