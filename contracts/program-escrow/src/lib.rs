@@ -4890,7 +4890,7 @@ impl ProgramEscrowContract {
     /// a `SpendLimitExceededEvent` audit event will be emitted.
     ///
     /// # Security and deterministic behavior
-    /// - Admin only.
+    /// - Admin only. This requires admin authority, not any delegate permission bit.
     /// - `threshold_amount` must be strictly positive; zero or negative
     ///   values are rejected with `InvalidAmount`.
     /// - Payout validation checks this threshold **before** balance checks
@@ -5134,7 +5134,7 @@ impl ProgramEscrowContract {
 
     /// Set or update the per-program circuit breaker failure threshold.
     ///
-    /// Only the program's `authorized_payout_key` may call this.
+    /// Only the program's `authorized_payout_key` may call this. This requires controller authority, not any delegate permission bit.
     ///
     /// # Arguments
     /// * `program_id` - Program to configure.
