@@ -4727,6 +4727,13 @@ impl ProgramEscrowContract {
             .unwrap_or(0u32)
     }
 
+    /// Update the global rate limit configuration.
+    ///
+    /// # Precedence Note
+    /// The global `RateLimitConfig` is currently not strictly enforced for payout batch sizes 
+    /// or cumulative payout volumes. The per-program spend threshold (set via `set_program_spend_threshold`) 
+    /// acts as the most restrictive and only effective limit for payouts. The per-program value 
+    /// implicitly overrides this global configuration for payout bounds.
     pub fn update_rate_limit_config(
         env: Env,
         window_size: u64,
@@ -4784,6 +4791,11 @@ impl ProgramEscrowContract {
     /// - Payout validation checks this threshold **before** balance checks
     ///   so clients observe stable, deterministic failures.
     /// - Emits `SpendLimitSetEvent` after the new value is persisted.
+    ///
+    /// # Precedence Note
+    /// This per-program threshold is the strictly enforced limit for payouts. 
+    /// It effectively overrides any global limits such as `RateLimitConfig`, which 
+    /// are not actively enforced as blocking limits for batch sizes or volumes.
     pub fn set_program_spend_threshold(env: Env, program_id: String, threshold_amount: i128) {
         let admin = Self::require_admin(&env);
         if threshold_amount <= 0 {
