@@ -3,6 +3,7 @@ import { ChevronDown, ChevronRight, Plus, Settings as SettingsIcon, AlertCircle,
 import { useTheme } from "../../../shared/contexts/ThemeContext";
 import { SkeletonLoader } from "../../../shared/components/SkeletonLoader";
 import { DashboardTab } from "../components/dashboard/DashboardTab";
+import { AnalyticsTab } from "../components/dashboard/AnalyticsTab";
 import { IssuesTab } from "../components/issues/IssuesTab";
 import { PullRequestsTab } from "../components/pull-requests/PullRequestsTab";
 import { TabType } from "../types";
@@ -80,7 +81,7 @@ export function MaintainersPage({ onNavigate }: MaintainersPageProps) {
     return `https://github.com/${owner}.png?size=${size}`;
   };
 
-  const tabs: TabType[] = ["Dashboard", "Issues", "Pull Requests"];
+  const tabs: TabType[] = ["Dashboard", "Issues", "Pull Requests", "Analytics"];
 
   // Fetch pending setup projects (for New Project Setup modal after GitHub App install)
   const loadPendingSetup = async () => {
@@ -576,6 +577,14 @@ export function MaintainersPage({ onNavigate }: MaintainersPageProps) {
       )}
 
       {activeTab === "Pull Requests" && <PullRequestsTab selectedProjects={selectedProjects} onRefresh={refreshAll} />}
+
+      {activeTab === "Analytics" && (
+        <AnalyticsTab
+          selectedProjects={selectedProjects}
+          isLoadingProjects={isLoading}
+          onNavigateToLeaderboard={() => onNavigate("leaderboard")}
+        />
+      )}
 
       {/* Install GitHub App Modal */}
       <InstallGitHubAppModal isOpen={isAddModalOpen} onClose={() => setIsAddModalOpen(false)} onSuccess={refreshAll} />

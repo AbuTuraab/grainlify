@@ -4,6 +4,7 @@ import { ExternalLink, Copy, Circle, ArrowLeft, GitPullRequest } from 'lucide-re
 import { useTheme } from '../../../shared/contexts/ThemeContext';
 import { getPublicProject, getPublicProjectIssues, getPublicProjectPRs } from '../../../shared/api/client';
 import { SkeletonLoader } from '../../../shared/components/SkeletonLoader';
+import { MediaEmbed } from '../../../shared/components/MediaEmbed';
 import ReactMarkdown from 'react-markdown';
 import { LanguageIcon } from '../../../shared/components/LanguageIcon';
 import { ProjectReleaseTimeline } from '../../ProjectDetailPage/ProjectReleaseTimeline';
@@ -91,8 +92,35 @@ function OverviewMarkdown({ readme, theme }: { readme: string; theme: string }) 
             {...props}
           />
         ),
-        img: ({ ...props }) => (
-          <img className="rounded-[12px] max-w-full h-auto my-4" alt="" {...props} />
+        img: ({ src, alt, ...props }) => {
+          // Route animated GIFs through MediaEmbed for pause control + lazy-load
+          if (src && /\.gif(\?.*)?$/i.test(src)) {
+            return (
+              <MediaEmbed
+                src={src}
+                kind="gif"
+                title={alt || undefined}
+                className="my-4"
+              />
+            );
+          }
+          return (
+            <img
+              className="rounded-[12px] max-w-full h-auto my-4"
+              alt={alt || ''}
+              src={src}
+              {...props}
+            />
+          );
+        },
+        // Route <video> tags in README markdown through MediaEmbed
+        video: ({ src, poster, ...props }: React.VideoHTMLAttributes<HTMLVideoElement>) => (
+          <MediaEmbed
+            src={src || ''}
+            kind="video"
+            poster={poster}
+            className="my-4"
+          />
         ),
         strong: ({ ...props }) => (
           <strong className={`font-bold ${headingColor}`} {...props} />
