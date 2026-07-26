@@ -9,8 +9,7 @@ crate-type = ["cdylib", "rlib"]
 [dependencies]
 soroban-sdk = "=21.7.7"
 grainlify-core = { path = "../grainlify-core", default-features = false }
-# Force ethnum >= 1.5.3 so CI on Rust 1.97+ compiles (1.5.2 hits E0512 transmute).
-ethnum = "1.5.3"
+ethnum = "1.5"
 
 [dev-dependencies]
 soroban-sdk = { version = "=21.7.7", features = ["testutils"] }
@@ -19,9 +18,12 @@ proptest = "1.4"
 [profile.release]
 overflow-checks = true
 opt-level = "z"
-lto = true
-codegen-units = 1
-panic = "abort"
 debug = 0
 strip = "symbols"
 debug-assertions = false
+panic = "abort"
+codegen-units = 1
+lto = true
+
+[profile.test]
+overflow-checks = true
