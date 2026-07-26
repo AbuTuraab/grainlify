@@ -1296,6 +1296,18 @@ pub enum DataKey {
     /// enabling dwell-time queries for ecosystem operators.
     /// Written on each status change; read via get_program_lifecycle_timeline.
     LifecycleTimeline(String),
+    /// Archived program payout history: program_id → Vec<PayoutRecord>.
+    ///
+    /// Written once during `archive_program` by migrating `payout_history`
+    /// out of the hot instance-storage `ProgramData` entry and into
+    /// Soroban's persistent-storage tier, which carries different rent costs
+    /// and is appropriate for read-only, rarely-accessed historical data.
+    ///
+    /// After archival the instance-storage `ProgramData.payout_history` is
+    /// cleared to an empty `Vec`, shrinking the instance-storage footprint
+    /// immediately.  Reads go through `get_archived_program_payout_history`
+    /// which checks this key directly.
+    ArchivedPayoutHistory(String),
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -3557,6 +3569,22 @@ impl ProgramEscrowContract {
     }
 
     /// Archive a program (mark as historical/read-only). Admin-only.
+    ///
+    /// ## Storage-tier migration
+    ///
+    /// On archival, `payout_history` is **migrated** from the hot
+    /// instance-storage `ProgramData` entry into the persistent-storage tier
+    /// under `DataKey::ArchivedPayoutHistory(program_id)`.  The in-struct
+    /// vector is then replaced with an empty `Vec`, shrinking the
+    /// instance-storage footprint immediately.
+    ///
+    /// Persistent storage is rent-managed differently from instance storage:
+    /// it is priced per-entry rather than contributing to the instance
+    /// rent-extension cost, making it the correct tier for data that is
+    /// read-only and rarely accessed after archival.
+    ///
+    /// Historical records remain fully queryable via
+    /// `get_archived_program_payout_history` after this call.
     pub fn archive_program(env: Env, program_id: String) {
         Self::require_admin(&env);
         let program_key = DataKey::Program(program_id.clone());
@@ -3565,6 +3593,22 @@ impl ProgramEscrowContract {
             .instance()
             .get(&program_key)
             .expect("Program not found");
+
+        // ── Migrate payout_history to persistent storage ──────────────────
+        // Move the full history vec into persistent storage under the
+        // archived-history key before clearing it from ProgramData.  This
+        // keeps the instance-storage entry small while preserving full
+        // auditability in the persistent tier.
+        let history_key = DataKey::ArchivedPayoutHistory(program_id.clone());
+        // Guard against double-archival: only write if not already present.
+        if !env.storage().persistent().has(&history_key) {
+            env.storage()
+                .persistent()
+                .set(&history_key, &program_data.payout_history);
+        }
+        // Clear the inline history so the instance-storage entry no longer
+        // carries the full Vec<PayoutRecord> weight.
+        program_data.payout_history = soroban_sdk::Vec::new(&env);
 
         program_data.archived = true;
         program_data.archived_at = Some(env.ledger().timestamp());
@@ -3586,6 +3630,30 @@ impl ProgramEscrowContract {
             (symbol_short!("Archived"),),
             (program_id, env.ledger().timestamp()),
         );
+    }
+
+    /// Return the full payout history for an archived program.
+    ///
+    /// After `archive_program` is called the history is stored in the
+    /// persistent-storage tier under `DataKey::ArchivedPayoutHistory`.
+    /// This function is the canonical read path for that data.
+    ///
+    /// Returns an empty `Vec` when:
+    /// - the program has never been archived, or
+    /// - the program had no payouts before archival.
+    ///
+    /// # Security
+    /// - Read-only; never mutates state.
+    /// - No authorization required — payout records are public on-chain data.
+    pub fn get_archived_program_payout_history(
+        env: Env,
+        program_id: String,
+    ) -> soroban_sdk::Vec<PayoutRecord> {
+        let key = DataKey::ArchivedPayoutHistory(program_id);
+        env.storage()
+            .persistent()
+            .get::<DataKey, soroban_sdk::Vec<PayoutRecord>>(&key)
+            .unwrap_or_else(|| soroban_sdk::Vec::new(&env))
     }
 
     /// Get all archived program IDs.
@@ -8391,7 +8459,8 @@ mod test_pagination;
 mod test_dynamic_pricing;
 // mod test_pagination;
 // Pre-existing broken test modules excluded until their referenced types/methods are implemented:
-// #[cfg(test)] mod test_archival;
+#[cfg(test)]
+mod test_archival;
 #[cfg(test)]
 mod test_batch_operations;
 // #[cfg(test)] mod test_pause;
