@@ -600,10 +600,6 @@ fn test_threat_model_fee_drain_prevention() {
     );
 }
 
-    let history = client.get_program_release_history();
-    assert_eq!(history.len(), 3);
-}
-
 // ---------------------------------------------------------------------------
 // Full program lifecycle integration test with batch payouts across two
 // independent program-escrow instances.
