@@ -150,6 +150,12 @@ mod errors;
 pub use errors::BatchPayoutError;
 use errors::ContractError;
 
+mod metadata;
+pub use metadata::{
+    CompressedCustomField, CompressedProgramMetadata, MetadataFieldKey,
+    try_decode_legacy_metadata,
+};
+
 mod dynamic_pricing;
 pub use dynamic_pricing::{
     DynamicPricingConfig, PricingState, PricingEngine, PricingError,
@@ -1253,6 +1259,9 @@ pub enum DataKey {
     SpendingState(String),
     ReadOnlyMode,
     Metadata(String),
+    /// Compressed metadata stored under `MetadataFieldKey` enum keys.
+    /// Read path falls back to `Metadata(String)` for backwards compatibility.
+    MetadataV2(String),
     RotationNonce(String),
     ReleaseTriggerSchemaVersion,
     ReentrancyGuard,
@@ -2709,9 +2718,16 @@ impl ProgramEscrowContract {
         );
 
         if let Some(ref pm) = metadata {
+            // Store in legacy format for existing readers.
             env.storage()
                 .instance()
                 .set(&DataKey::Metadata(program_data.program_id.clone()), pm);
+            // Store in compressed format for reduced storage cost.
+            let compressed = CompressedProgramMetadata::from_legacy(&env, pm);
+            env.storage().instance().set(
+                &DataKey::MetadataV2(program_data.program_id.clone()),
+                &compressed,
+            );
         }
 
         program_data
@@ -4197,9 +4213,16 @@ impl ProgramEscrowContract {
             DELEGATE_PERMISSION_UPDATE_META,
         );
 
+        // Store in legacy format for existing readers.
         env.storage()
             .instance()
             .set(&DataKey::Metadata(program_id.clone()), &metadata);
+        // Store in compressed format for reduced storage cost.
+        let compressed = CompressedProgramMetadata::from_legacy(&env, &metadata);
+        env.storage().instance().set(
+            &DataKey::MetadataV2(program_id.clone()),
+            &compressed,
+        );
 
         env.events().publish(
             (PROGRAM_METADATA_UPDATED, program_id.clone()),
@@ -6529,7 +6552,12 @@ impl ProgramEscrowContract {
         Self::get_idempotency_record(&env, &idempotency_key)
     }
 
-    /// Get program metadata stored separately under `DataKey::Metadata`.
+    /// Get program metadata.
+    ///
+    /// Attempts to read compressed metadata from `DataKey::MetadataV2` first
+    /// (decompressing on the fly).  Falls back to the legacy `DataKey::Metadata`
+    /// key for backwards compatibility with programs that stored metadata before
+    /// the compression upgrade.
     ///
     /// # Arguments
     /// * `program_id` - The program identifier
@@ -6537,6 +6565,14 @@ impl ProgramEscrowContract {
     /// # Returns
     /// `Some(ProgramMetadata)` if metadata has been set, `None` otherwise.
     pub fn get_program_metadata(env: Env, program_id: String) -> Option<ProgramMetadata> {
+        // Try compressed (V2) format first.
+        let v2_key = DataKey::MetadataV2(program_id.clone());
+        if env.storage().instance().has(&v2_key) {
+            let compressed: CompressedProgramMetadata =
+                env.storage().instance().get(&v2_key).unwrap();
+            return Some(compressed.into_legacy(&env));
+        }
+        // Fall back to legacy (V1) format.
         env.storage().instance().get(&DataKey::Metadata(program_id))
     }
 
