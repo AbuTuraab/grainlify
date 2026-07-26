@@ -168,4 +168,60 @@ mod test {
         assert_eq!(metrics_after.success_count, 0);
         assert_eq!(metrics_after.total_outflow, 0);
     }
+
+    #[test]
+    fn test_precedence_per_program_threshold_overrides_global_rate_limit() {
+        let env = Env::default();
+        env.mock_all_auths();
+        
+        let token_admin = Address::generate(&env);
+        let token_id = env.register_stellar_asset_contract(token_admin.clone());
+        let (client, admin) = setup_test(&env);
+        
+        let creator = Address::generate(&env);
+        let initial_balance = 5000;
+        soroban_sdk::token::StellarAssetClient::new(&env, &token_id).mint(&creator, &initial_balance);
+        
+        let program_id = soroban_sdk::String::from_str(&env, "PROG1");
+        client.init_program(
+            &program_id,
+            &admin,
+            &token_id,
+            &creator,
+            &Some(initial_balance),
+            &None,
+        );
+        client.publish_program();
+        
+        // Set global rate limit config to be very restrictive (max 1 operation).
+        client.update_rate_limit_config(&3600, &1, &60);
+        
+        // Set per-program spend threshold to 1000.
+        client.set_program_spend_threshold(&program_id, &1000);
+        
+        // Scenario 1: Violates global rate limit (batch size 2 > max_operations 1)
+        // but satisfies per-program threshold (2 * 100 = 200 <= 1000)
+        let mut recipients = soroban_sdk::Vec::new(&env);
+        let mut amounts = soroban_sdk::Vec::new(&env);
+        recipients.push_back(Address::generate(&env));
+        recipients.push_back(Address::generate(&env));
+        amounts.push_back(100);
+        amounts.push_back(100);
+        
+        // This should SUCCEED because global RateLimitConfig is not strictly enforced on payout sizes.
+        // The per-program threshold is the only effectively enforced limit.
+        let result = client.try_batch_payout(&recipients, &amounts, &None);
+        assert!(result.is_ok(), "Payout should succeed, global rate limit is not enforced for batch size");
+        
+        // Scenario 2: Satisfies global rate limit (batch size 1 <= max_operations 1)
+        // but violates per-program threshold (1 * 2000 = 2000 > 1000)
+        let mut recipients2 = soroban_sdk::Vec::new(&env);
+        let mut amounts2 = soroban_sdk::Vec::new(&env);
+        recipients2.push_back(Address::generate(&env));
+        amounts2.push_back(2000);
+        
+        // This should FAIL because the per-program spend threshold is strictly enforced.
+        let result2 = client.try_batch_payout(&recipients2, &amounts2, &None);
+        assert!(result2.is_err(), "Payout should fail, per-program spend threshold is strictly enforced");
+    }
 }
