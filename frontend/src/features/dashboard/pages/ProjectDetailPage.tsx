@@ -1,14 +1,12 @@
-import React, { createContext, useContext, useEffect, useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useState } from 'react';
 import { useParams } from 'react-router-dom';
 import { ExternalLink, Copy, Circle, ArrowLeft, GitPullRequest } from 'lucide-react';
 import { useTheme } from '../../../shared/contexts/ThemeContext';
 import { getPublicProject, getPublicProjectIssues, getPublicProjectPRs } from '../../../shared/api/client';
 import { SkeletonLoader } from '../../../shared/components/SkeletonLoader';
-import ReactMarkdown from 'react-markdown';
 import { LanguageIcon } from '../../../shared/components/LanguageIcon';
 import { ProjectReleaseTimeline } from '../../ProjectDetailPage/ProjectReleaseTimeline';
-
-const InPreContext = createContext(false);
+import { ReadmeEmbed } from '../components/ReadmeEmbed';
 
 interface ProjectDetailPageProps {
   onBack?: () => void;
@@ -16,92 +14,6 @@ interface ProjectDetailPageProps {
   projectId?: string;
   onClose?: () => void;
   backLabel?: string;
-}
-
-function OverviewMarkdown({ readme, theme }: { readme: string; theme: string }) {
-  const inPre = useContext(InPreContext);
-  const dark = theme === 'dark';
-  const textColor = dark ? 'text-[#d4d4d4]' : 'text-[#4a3f2f]';
-  const headingColor = dark ? 'text-[#f5f5f5]' : 'text-[#2d2820]';
-
-  return (
-    <ReactMarkdown
-      components={{
-        h1: ({ ...props }) => (
-          <h1 className={`text-[24px] font-bold mb-4 mt-6 first:mt-0 ${headingColor}`} {...props} />
-        ),
-        h2: ({ ...props }) => (
-          <h2 className={`text-[20px] font-bold mb-3 mt-5 ${headingColor}`} {...props} />
-        ),
-        h3: ({ ...props }) => (
-          <h3 className={`text-[18px] font-semibold mb-2 mt-4 ${headingColor}`} {...props} />
-        ),
-        h4: ({ ...props }) => (
-          <h4 className={`text-[16px] font-semibold mb-2 mt-3 ${headingColor}`} {...props} />
-        ),
-        p: ({ ...props }) => (
-          <p className={`mb-4 leading-relaxed ${textColor}`} {...props} />
-        ),
-        a: ({ ...props }) => (
-          <a
-            className={`font-semibold hover:underline ${dark ? 'text-[#f5c563] hover:text-[#ffd700]' : 'text-[#b8872f] hover:text-[#8b6f3a]'}`}
-            target="_blank"
-            rel="noopener noreferrer"
-            {...props}
-          />
-        ),
-        code: ({ ...props }) => {
-          if (inPre) {
-            return (
-              <code
-                className={`text-[13px] font-mono ${textColor}`}
-                {...props}
-              />
-            );
-          }
-          return (
-            <code
-              className={`inline px-1.5 py-0.5 rounded text-[13px] font-mono ${dark ? 'bg-white/[0.15] text-[#f5c563]' : 'bg-[#e8e0d0] text-[#6b5d4d]'}`}
-              {...props}
-            />
-          );
-        },
-        pre: ({ children, ...props }) => (
-          <InPreContext.Provider value={true}>
-            <pre
-              className={`mb-4 overflow-x-auto rounded-[12px] p-4 font-mono text-[13px] ${dark ? 'bg-white/[0.12] border border-white/20 text-[#e8dfd0]' : 'bg-white/[0.20] border border-white/30 text-[#2d2820]'}`}
-              {...props}
-            >
-              {children}
-            </pre>
-          </InPreContext.Provider>
-        ),
-        ul: ({ ...props }) => (
-          <ul className={`list-disc pl-6 mb-4 space-y-1.5 ${textColor}`} {...props} />
-        ),
-        ol: ({ ...props }) => (
-          <ol className={`list-decimal pl-6 mb-4 space-y-1.5 ${textColor}`} {...props} />
-        ),
-        li: ({ ...props }) => (
-          <li className={`leading-relaxed ${textColor}`} {...props} />
-        ),
-        blockquote: ({ ...props }) => (
-          <blockquote
-            className={`border-l-4 pl-4 italic my-4 ${dark ? 'border-[#c9983a]/60 text-[#d4d4d4] bg-white/[0.05]' : 'border-[#c9983a]/70 text-[#4a3f2f] bg-white/[0.10]'}`}
-            {...props}
-          />
-        ),
-        img: ({ ...props }) => (
-          <img className="rounded-[12px] max-w-full h-auto my-4" alt="" {...props} />
-        ),
-        strong: ({ ...props }) => (
-          <strong className={`font-bold ${headingColor}`} {...props} />
-        ),
-      }}
-    >
-      {readme}
-    </ReactMarkdown>
-  );
 }
 
 const mockMilestones = [
@@ -808,6 +720,22 @@ export function ProjectDetailPage({ onBack, onIssueClick, projectId: propProject
               <span className="text-[#c9983a]">✦</span>
               Overview
             </h2>
+            {githubUrl && (
+              <a
+                href={githubUrl}
+                target="_blank"
+                rel="noopener noreferrer"
+                aria-label="View README on GitHub (opens in new tab)"
+                className={`flex items-center gap-1.5 text-[13px] font-semibold underline decoration-1 underline-offset-2 transition-colors ${
+                  theme === 'dark'
+                    ? 'text-[#f5c563] hover:text-[#ffd700]'
+                    : 'text-[#6b4c1a] hover:text-[#4a3310]'
+                }`}
+              >
+                <ExternalLink className="w-3.5 h-3.5" aria-hidden="true" />
+                View on GitHub
+              </a>
+            )}
           </div>
           {isLoading ? (
             <div className="space-y-3">
@@ -816,9 +744,7 @@ export function ProjectDetailPage({ onBack, onIssueClick, projectId: propProject
               <SkeletonLoader className="h-4 w-3/4" />
             </div>
           ) : project?.readme ? (
-            <div className="prose prose-sm max-w-none [&_pre]:my-4 [&_pre]:overflow-x-auto [&_pre]:rounded-[12px] [&_pre]:p-4 [&_pre_code]:!p-0 [&_pre_code]:!bg-transparent [&_pre_code]:!border-0 [&_pre_code]:!text-inherit [&_pre_code]:block">
-              <OverviewMarkdown readme={project.readme} theme={theme} />
-            </div>
+            <ReadmeEmbed content={project.readme} theme={theme} />
           ) : description ? (
             <p className={`text-[15px] leading-relaxed transition-colors ${
               theme === 'dark' ? 'text-[#d4d4d4]' : 'text-[#4a3f2f]'
@@ -829,14 +755,14 @@ export function ProjectDetailPage({ onBack, onIssueClick, projectId: propProject
             <p className={`text-[15px] leading-relaxed transition-colors ${
               theme === 'dark' ? 'text-[#d4d4d4]' : 'text-[#4a3f2f]'
             }`}>
-              No description available. Visit the <a 
-                href={githubUrl} 
-                target="_blank" 
+              No description available. Visit the <a
+                href={githubUrl}
+                target="_blank"
                 rel="noopener noreferrer"
-                className={`font-semibold hover:underline transition-colors ${
-                  theme === 'dark' 
-                    ? 'text-[#f5c563] hover:text-[#ffd700]' 
-                    : 'text-[#b8872f] hover:text-[#8b6f3a]'
+                className={`font-semibold underline decoration-1 underline-offset-2 transition-colors ${
+                  theme === 'dark'
+                    ? 'text-[#f5c563] hover:text-[#ffd700]'
+                    : 'text-[#6b4c1a] hover:text-[#4a3310]'
                 }`}
               >GitHub repository</a> for more information.
             </p>
