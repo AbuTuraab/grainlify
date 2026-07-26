@@ -42,6 +42,10 @@ Every assertion message includes the **scenario seed**.  To reproduce a
 failure, either re-run the filtered test or construct
 `ChaosScenario::generate(seed)` in a unit test.
 
+The harness constructs each `Env` with
+`EnvTestConfig { capture_snapshot_at_drop: false }` so the seeded sweep
+does not flood `test_snapshots/` with dozens of ledger JSON files.
+
 ---
 
 ## 3. Architecture

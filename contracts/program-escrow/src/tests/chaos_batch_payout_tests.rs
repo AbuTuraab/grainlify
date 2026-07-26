@@ -31,7 +31,7 @@ extern crate std;
 
 use soroban_sdk::{
     symbol_short,
-    testutils::{Address as _, Ledger},
+    testutils::{Address as _, EnvTestConfig, Ledger},
     token, vec, Address, Env, String, Vec,
 };
 
@@ -170,7 +170,11 @@ struct Harness<'a> {
 }
 
 fn setup_harness(initial_balance: i128) -> Harness<'static> {
-    let env = Env::default();
+    // Disable ledger snapshot capture — the seeded sweep creates dozens of
+    // Env instances and would otherwise flood test_snapshots/ with noise.
+    let env = Env::new_with_config(EnvTestConfig {
+        capture_snapshot_at_drop: false,
+    });
     env.mock_all_auths();
     env.ledger().set_timestamp(1_700_000_000);
 

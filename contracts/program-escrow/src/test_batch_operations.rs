@@ -269,7 +269,11 @@ fn test_idempotent_batch_payout_replay_emits_audit_event() {
 
     let events = ctx.env.events().all();
     // Find a BatchPayoutReplayedEvent whose idempotency_key matches
+    let replay_topic: soroban_sdk::Val = soroban_sdk::symbol_short!("BatPayRp").into_val(&ctx.env);
     let replayed_event = events.iter().find(|e| {
+        if !e.1.contains(&replay_topic) {
+            return false;
+        }
         let result: Result<BatchPayoutReplayedEvent, _> = (&e.2).try_into_val(&ctx.env);
         if let Ok(ev) = result {
             ev.idempotency_key == key
@@ -448,8 +452,12 @@ fn test_idempotent_batch_payout_audit_trail_integrity() {
     }).count();
     assert_eq!(replay_events_count, 1, "Expected exactly one BatchPayoutReplayed event after replay");
 
-    // Verify the replay event data
+    // Verify the replay event data — filter by topic first so unrelated
+    // schema-version events are not force-decoded as BatchPayoutReplayedEvent.
     let replayed_event = events_after_second.iter().find(|e| {
+        if !e.1.contains(&replay_val) {
+            return false;
+        }
         let result: Result<BatchPayoutReplayedEvent, _> = (&e.2).try_into_val(&ctx.env);
         if let Ok(ev) = result {
             ev.idempotency_key == key
@@ -523,7 +531,8 @@ fn make_single_key(env: &Env, program_id: &str, recipient: &Address, nonce: &str
     let len = addr_str.len() as usize;
     addr_str.copy_into_slice(&mut buf[..len]);
     let rust_str = core::str::from_utf8(&buf[..len]).unwrap();
-    let prefix = &rust_str[..8.min(len)];
+    // Use the trailing chars — test addresses share a long `CAAAAA…` prefix.
+    let prefix = &rust_str[len.saturating_sub(8)..];
     String::from_str(
         env,
         &std::format!("{}-single-{}-{}", program_id, prefix, nonce),
@@ -539,7 +548,7 @@ fn make_batch_key(env: &Env, program_id: &str, recipients: &soroban_sdk::Vec<Add
     let len = addr_str.len() as usize;
     addr_str.copy_into_slice(&mut buf[..len]);
     let rust_str = core::str::from_utf8(&buf[..len]).unwrap();
-    let prefix = &rust_str[..8.min(len)];
+    let prefix = &rust_str[len.saturating_sub(8)..];
     let count = recipients.len();
     String::from_str(
         env,
@@ -755,7 +764,7 @@ fn test_key_at_max_length_accepted() {
 
 /// A key exceeding 256 characters is rejected by the contract.
 #[test]
-#[should_panic(expected = "Idempotency key exceeds maximum length")]
+#[should_panic(expected = "IdempotencyKeyInvalid")]
 fn test_key_exceeding_max_length_rejected() {
     let ctx = setup();
     init_program(&ctx, "hackathon-2024", 10_000);
@@ -773,7 +782,7 @@ fn test_key_exceeding_max_length_rejected() {
 
 /// An empty key is rejected by the contract.
 #[test]
-#[should_panic(expected = "Idempotency key cannot be empty")]
+#[should_panic(expected = "IdempotencyKeyInvalid")]
 fn test_empty_key_rejected() {
     let ctx = setup();
     init_program(&ctx, "hackathon-2024", 10_000);
