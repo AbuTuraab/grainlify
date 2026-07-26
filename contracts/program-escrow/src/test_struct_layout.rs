@@ -17,8 +17,10 @@ fn make_minimal_program_data(env: &Env) -> ProgramData {
         archived_at: None,
         initial_liquidity: 10_000,
         circuit_breaker_threshold: None,
+        fot_router: None,
         program_id: SorobanString::from_str(env, "test-program"),
         payout_history: soroban_sdk::Vec::new(env),
+        fot_router: OptionalFotRouter::None,
         reference_hash: None,
     }
 }
@@ -42,8 +44,10 @@ fn make_full_program_data(env: &Env) -> ProgramData {
         archived_at: Some(99999),
         initial_liquidity: 10_000,
         circuit_breaker_threshold: Some(5),
+        fot_router: None,
         program_id: SorobanString::from_str(env, "full-program"),
         payout_history: soroban_sdk::vec![env, payout],
+        fot_router: OptionalFotRouter::None,
         reference_hash: Some(Bytes::from_array(env, &[0x01, 0x02, 0x03, 0x04])),
     }
 }
