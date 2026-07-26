@@ -1,4 +1,4 @@
-#![cfg(test)]
+﻿#![cfg(test)]
 
 //! Exhaustive matrix tests for the three granular pause flags.
 //!
@@ -222,7 +222,7 @@ fn observe_trigger_program_releases(flags: Flags) -> bool {
     ctx.client
         .create_program_release_schedule(&recipient, &RELEASE_AMOUNT, &DUE_RELEASE_TIMESTAMP);
     set_pause_flags(&ctx.client, flags);
-    ctx.client.try_trigger_program_releases().is_ok()
+    ctx.client.try_trigger_program_releases(&None).is_ok()
 }
 
 /// Return whether `cancel_claim` succeeds under the supplied flags.
@@ -520,3 +520,4 @@ fn test_unpausing_release_does_not_unpause_lock_or_refund() {
         "refund should remain blocked while refund_paused stays enabled"
     );
 }
+

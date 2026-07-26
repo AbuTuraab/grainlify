@@ -9,6 +9,7 @@ import { Modal, ModalFooter, ModalButton } from '../../../../shared/components/u
 import { applyToIssue, getProjectIssues, postBotComment, withdrawApplication, assignApplicant, unassignApplicant, rejectApplication } from '../../../../shared/api/client';
 import { formatDistanceToNow } from 'date-fns';
 import { IssueCardSkeleton } from '../../../../shared/components/IssueCardSkeleton';
+import { TimestampDisplay } from '../../../../shared/components/TimestampDisplay';
 import RenderMarkdownContent from '../../../../app/utils/renderMarkdown';
 
 interface Project {
@@ -1026,8 +1027,13 @@ Only applications submitted via the apply link above will be considered. Please 
                                   } group-hover/user:text-[#c9983a]`}>
                                   {application.author.name}
                                 </h4>
-                                <p className={`text-[12px] transition-colors ${isDark ? 'text-[#b8a898]' : 'text-[#7a6b5a]'
-                                  }`}>Applied - {application.timeAgo}</p>
+                                <div className={`text-[12px] flex items-center gap-1 transition-colors ${isDark ? 'text-[#b8a898]' : 'text-[#7a6b5a]'}`}>
+                                  <span>Applied -</span>
+                                  <TimestampDisplay
+                                    timestamp={(application as any).appliedDate || (application as any).createdAt}
+                                    fallbackText={application.timeAgo}
+                                  />
+                                </div>
                               </div>
                               <ExternalLink className="w-4 h-4 text-[#7a6b5a] ml-auto opacity-0 group-hover/user:opacity-100 transition-opacity" />
                             </button>
@@ -1239,8 +1245,11 @@ Only applications submitted via the apply link above will be considered. Please 
                               </span>
                             )}
                           </div>
-                          <span className={`text-[12px] transition-colors ${isDark ? 'text-[#b8a898]' : 'text-[#7a6b5a]'
-                            }`}>{discussion.timeAgo}</span>
+                          <TimestampDisplay
+                            timestamp={discussion.createdAt || discussion.timestamp}
+                            fallbackText={discussion.timeAgo}
+                            className={`text-[12px] transition-colors ${isDark ? 'text-[#b8a898]' : 'text-[#7a6b5a]'}`}
+                          />
                         </div>
                       </div>
 
