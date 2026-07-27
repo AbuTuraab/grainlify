@@ -124,11 +124,11 @@ fn test_cache_key_isolation_by_program_id() {
         token_address: escrow.clone(),
         initial_liquidity: 0,
         risk_flags: 0,
-        reference_hash: None,
-        archived: false,
-        archived_at: None,
-        circuit_breaker_threshold: None,
-        fot_router: program_escrow::OptionalFotRouter::None,
+        reference_hash: None,            archived: false,
+            archived_at: None,
+            status: program_escrow::ProgramStatus::Active,
+            circuit_breaker_threshold: None,
+            fot_router: program_escrow::OptionalFotRouter::None,
     };
     env.storage().temporary().set(&key_a, &dummy_a);
 
@@ -190,11 +190,11 @@ fn test_cache_hit_returns_cached_program_data() {
         token_address: escrow.clone(),
         initial_liquidity: 0,
         risk_flags: 0,
-        reference_hash: None,
-        archived: false,
-        archived_at: None,
-        circuit_breaker_threshold: None,
-        fot_router: program_escrow::OptionalFotRouter::None,
+        reference_hash: None,            archived: false,
+            archived_at: None,
+            status: program_escrow::ProgramStatus::Active,
+            circuit_breaker_threshold: None,
+            fot_router: program_escrow::OptionalFotRouter::None,
     };
     env.storage().temporary().set(&key, &data);
 
@@ -258,11 +258,11 @@ fn test_invalidate_program_data_causes_cache_miss() {
         token_address: escrow.clone(),
         initial_liquidity: 0,
         risk_flags: 0,
-        reference_hash: None,
-        archived: false,
-        archived_at: None,
-        circuit_breaker_threshold: None,
-        fot_router: program_escrow::OptionalFotRouter::None,
+        reference_hash: None,            archived: false,
+            archived_at: None,
+            status: program_escrow::ProgramStatus::Active,
+            circuit_breaker_threshold: None,
+            fot_router: program_escrow::OptionalFotRouter::None,
     };
     env.storage().temporary().set(&key, &data);
 
@@ -432,11 +432,11 @@ fn test_fee_and_program_data_cache_independent() {
         token_address: escrow.clone(),
         initial_liquidity: 0,
         risk_flags: 0,
-        reference_hash: None,
-        archived: false,
-        archived_at: None,
-        circuit_breaker_threshold: None,
-        fot_router: program_escrow::OptionalFotRouter::None,
+        reference_hash: None,            archived: false,
+            archived_at: None,
+            status: program_escrow::ProgramStatus::Active,
+            circuit_breaker_threshold: None,
+            fot_router: program_escrow::OptionalFotRouter::None,
     };
     env.storage().temporary().set(&prog_key, &prog_data);
 
@@ -482,11 +482,11 @@ fn test_query_program_balance_and_fee_populates_both_cache_entries() {
         token_address: escrow.clone(),
         initial_liquidity: 0,
         risk_flags: 0,
-        reference_hash: None,
-        archived: false,
-        archived_at: None,
-        circuit_breaker_threshold: None,
-        fot_router: program_escrow::OptionalFotRouter::None,
+        reference_hash: None,            archived: false,
+            archived_at: None,
+            status: program_escrow::ProgramStatus::Active,
+            circuit_breaker_threshold: None,
+            fot_router: program_escrow::OptionalFotRouter::None,
     };
     let fee_config = program_escrow::FeeConfig {
         lock_fee_rate: 42,

@@ -795,6 +795,7 @@ pub struct ProgramData {
     pub reference_hash: Option<soroban_sdk::Bytes>,
     pub archived: bool,
     pub archived_at: Option<u64>,
+    pub status: ProgramStatus,
     /// Optional per-program circuit breaker failure threshold.
     /// If set, overrides the global default (3) for this program.
     /// Must be between 1 and 100 inclusive when set.
@@ -8956,4 +8957,9 @@ mod test_event_ordering;
 #[cfg(test)]
 #[path = "release_schedule_host.rs"]
 mod release_schedule_host;
+
+#[cfg(test)]
+mod bench_batch_performance {
+    include!("../../benchmarks/batch_performance.rs");
+}
 
