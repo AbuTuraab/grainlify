@@ -2717,6 +2717,10 @@ impl BountyEscrowContract {
     }
 
     /// Return the escrow data for a given bounty_id. Returns an error if not found.
+    ///
+    /// Anonymization-aware: only reads `DataKey::Escrow`, never `DataKey::EscrowAnon`,
+    /// so a bounty locked via `lock_funds_anonymous` returns `BountyNotFound` here rather
+    /// than any depositor-bearing record. See `docs/anonymous-lock-privacy.md`.
     pub fn get_escrow_info(env: Env, bounty_id: u64) -> Result<Escrow, Error> {
         env.storage()
             .persistent()
@@ -5799,6 +5803,10 @@ impl BountyEscrowContract {
 
     /// Get the metadata for a bounty. Returns a default (all-zero) record if
     /// no metadata has been written yet.
+    ///
+    /// Anonymization-aware: `EscrowMetadata` has no depositor-identifying field,
+    /// so this is safe to call for anonymously-locked bounties before resolution.
+    /// See `docs/anonymous-lock-privacy.md`.
     pub fn get_metadata(env: Env, bounty_id: u64) -> EscrowMetadata {
         env.storage()
             .persistent()
@@ -9294,6 +9302,10 @@ mod test_e2e_upgrade_with_pause;
 #[cfg(test)]
 mod test_status_transitions;
 // #[cfg(test)] mod test_upgrade_scenarios;
+
+/// Privacy-leak regression tests for anonymous-lock query paths (issue #1466).
+#[cfg(test)]
+mod test_anonymization;
 
 #[cfg(test)]
 #[path = "tests/conversion_tests.rs"]
