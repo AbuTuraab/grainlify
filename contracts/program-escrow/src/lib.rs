@@ -1406,6 +1406,8 @@ pub enum DataKey {
     /// enabling dwell-time queries for ecosystem operators.
     /// Written on each status change; read via get_program_lifecycle_timeline.
     LifecycleTimeline(String),
+    /// Lightweight hotness signal tracker: program_id -> access count
+    ProgramAccessSignal(String),
 
     /// Accumulated insurance-reserve balance in native token units.
     ///
@@ -2151,6 +2153,10 @@ const READ_ONLY_MODE_CHANGED: Symbol = symbol_short!("ROModeChg");
 
 #[contract]
 pub struct ProgramEscrowContract;
+
+const TTL_MIN_LEDGERS: u32 = 518_400; // ~30 days
+const TTL_MAX_LEDGERS: u32 = 3_110_400; // ~180 days
+const TTL_MAX_ACCESS_COUNT: u32 = 100;
 
 #[contractimpl]
 impl ProgramEscrowContract {
@@ -4107,6 +4113,7 @@ impl ProgramEscrowContract {
     fn store_program_data(env: &Env, program_id: &String, program_data: &ProgramData) {
         let program_key = DataKey::Program(program_id.clone());
         env.storage().instance().set(&program_key, program_data);
+        Self::track_and_extend_program_ttl(env, program_id, None);
 
         if env.storage().instance().has(&PROGRAM_DATA) {
             let existing: ProgramData = env
@@ -4118,6 +4125,34 @@ impl ProgramEscrowContract {
                 env.storage().instance().set(&PROGRAM_DATA, program_data);
             }
         }
+    }
+
+    /// Tracks program access frequency and adapts TTL dynamically based on hotness.
+    fn track_and_extend_program_ttl(env: &Env, program_id: &String, persistent_key: Option<&DataKey>) {
+        let signal_key = DataKey::ProgramAccessSignal(program_id.clone());
+        let mut access_count: u32 = env
+            .storage()
+            .persistent()
+            .get(&signal_key)
+            .unwrap_or(0);
+
+        if access_count < TTL_MAX_ACCESS_COUNT {
+            access_count += 1;
+            env.storage().persistent().set(&signal_key, &access_count);
+        }
+
+        let extra_ttl = (TTL_MAX_LEDGERS - TTL_MIN_LEDGERS)
+            .saturating_mul(access_count)
+            / TTL_MAX_ACCESS_COUNT;
+        
+        let ttl_to_set = TTL_MIN_LEDGERS + extra_ttl;
+        
+        env.storage().instance().extend_ttl(TTL_MIN_LEDGERS, ttl_to_set);
+
+        if let Some(key) = persistent_key {
+            env.storage().persistent().extend_ttl(key, TTL_MIN_LEDGERS, ttl_to_set);
+        }
+        env.storage().persistent().extend_ttl(&signal_key, TTL_MIN_LEDGERS, ttl_to_set);
     }
 
     fn require_program_owner_or_admin(
@@ -7107,8 +7142,13 @@ impl ProgramEscrowContract {
 
     /// Get program information
     ///
+    /// # Deprecation Note
+    /// This is the legacy singleton accessor. Use `get_program_info_v2` which
+    /// reads from `DataKey::Program(id)` instead.
+    ///
     /// # Returns
     /// ProgramData containing all program information
+    #[deprecated(note = "Use get_program_info_v2 instead")]
     pub fn get_program_info(env: Env) -> ProgramData {
         env.storage()
             .instance()
@@ -7982,6 +8022,7 @@ impl ProgramEscrowContract {
             .unwrap_or_else(|| soroban_sdk::Vec::new(env));
         index.push_back(record.clone());
         env.storage().persistent().set(&key, &index);
+        Self::track_and_extend_program_ttl(env, program_id, Some(&key));
     }
 
     /// Query idempotency key status
