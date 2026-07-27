@@ -4277,7 +4277,10 @@ impl ProgramEscrowContract {
     /// ## Security Invariants
     ///
     /// 1. **Immediate effect** — permissions are zeroed atomically in the same
-    ///    ledger as the call; there is no delay or grace period.
+    ///    ledger as the call; there is no delay or grace period. Both direct calls
+    ///    and facade queries (e.g., via `query_all_delegates`) reflect the revocation
+    ///    atomically within the same transaction and in the very next ledger read,
+    ///    with no caching or stale-read window.
     /// 2. **Idempotent** — calling when no delegate is set is a no-op (does not
     ///    panic) and still emits the event so the call is auditable.
     /// 3. **Event flag** — `ProgramDelegateRevokedEvent::emergency = true`
