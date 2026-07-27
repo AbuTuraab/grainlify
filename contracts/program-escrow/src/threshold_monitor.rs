@@ -17,36 +17,68 @@ use soroban_sdk::{contracttype, symbol_short, Address, Env, Symbol};
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ThresholdConfig {
-    /// Maximum failures allowed per time window
-    pub failure_rate_threshold: u32,
-    /// Maximum outflow amount per time window
+    /// Maximum failed operations permitted in a window.
     pub outflow_volume_threshold: i128,
     /// Maximum amount for a single payout transaction
     pub max_single_payout: i128,
-    /// Time window duration in seconds
-    pub time_window_secs: u64,
-    /// Minimum cooldown period before reopening (seconds)
-    pub cooldown_period_secs: u64,
-    /// Backoff multiplier for repeated breaches
-    pub cooldown_multiplier: u32,
+    /// Packed configuration fields:
+    /// bits 0-15: failure_rate_threshold
+    /// bits 16-39: time_window_secs
+    /// bits 40-55: cooldown_period_secs
+    /// bits 56-63: cooldown_multiplier
+    pub packed_config: u64,
 }
 
 impl ThresholdConfig {
     /// Default configuration with conservative thresholds
     pub fn default() -> Self {
-        ThresholdConfig {
-            failure_rate_threshold: 10,
+        let mut config = ThresholdConfig {
             outflow_volume_threshold: 5_000_000_0000000, // 5M tokens (7 decimals)
             max_single_payout: 500_000_0000000,          // 500K tokens
-            time_window_secs: 600,                       // 10 minutes
-            cooldown_period_secs: 300,                   // 5 minutes
-            cooldown_multiplier: 2,
-        }
+            packed_config: 0,
+        };
+        config.set_failure_rate_threshold(10);
+        config.set_time_window_secs(600);
+        config.set_cooldown_period_secs(300);
+        config.set_cooldown_multiplier(2);
+        config
+    }
+
+    pub fn failure_rate_threshold(&self) -> u32 {
+        (self.packed_config & 0xFFFF) as u32
+    }
+
+    pub fn set_failure_rate_threshold(&mut self, val: u32) {
+        self.packed_config = (self.packed_config & !0xFFFF) | ((val as u64) & 0xFFFF);
+    }
+
+    pub fn time_window_secs(&self) -> u64 {
+        (self.packed_config >> 16) & 0xFFFFFF
+    }
+
+    pub fn set_time_window_secs(&mut self, val: u64) {
+        self.packed_config = (self.packed_config & !(0xFFFFFF << 16)) | (((val as u64) & 0xFFFFFF) << 16);
+    }
+
+    pub fn cooldown_period_secs(&self) -> u64 {
+        (self.packed_config >> 40) & 0xFFFF
+    }
+
+    pub fn set_cooldown_period_secs(&mut self, val: u64) {
+        self.packed_config = (self.packed_config & !(0xFFFF << 40)) | (((val as u64) & 0xFFFF) << 40);
+    }
+
+    pub fn cooldown_multiplier(&self) -> u32 {
+        ((self.packed_config >> 56) & 0xFF) as u32
+    }
+
+    pub fn set_cooldown_multiplier(&mut self, val: u32) {
+        self.packed_config = (self.packed_config & !(0xFF << 56)) | (((val as u64) & 0xFF) << 56);
     }
 
     /// Validate configuration values
     pub fn validate(&self) -> Result<(), &'static str> {
-        if self.failure_rate_threshold == 0 || self.failure_rate_threshold > 1000 {
+        if self.failure_rate_threshold() == 0 || self.failure_rate_threshold() > 1000 {
             return Err("Failure threshold must be between 1 and 1000");
         }
         if self.outflow_volume_threshold <= 0 {
@@ -56,10 +88,10 @@ impl ThresholdConfig {
         if self.max_single_payout <= 0 {
             return Err("Max single payout must be greater than zero");
         }
-        if self.time_window_secs < 10 || self.time_window_secs > 86400 {
+        if self.time_window_secs() < 10 || self.time_window_secs() > 86400 {
             return Err("Time window must be between 10 and 86400 seconds");
         }
-        if self.cooldown_period_secs < 60 || self.cooldown_period_secs > 3600 {
+        if self.cooldown_period_secs() < 60 || self.cooldown_period_secs() > 3600 {
             return Err("Cooldown period must be between 60 and 3600 seconds");
         }
         Ok(())
@@ -124,6 +156,10 @@ pub enum ThresholdKey {
     CooldownMultiplier,
 }
 
+fn persistent_key(key: ThresholdKey) -> (Symbol, ThresholdKey) {
+    (symbol_short!("th"), key)
+}
+
 // ─────────────────────────────────────────────────────────
 // Error codes
 // ─────────────────────────────────────────────────────────
@@ -142,16 +178,16 @@ pub fn init_threshold_monitor(env: &Env) {
     let config = ThresholdConfig::default();
     env.storage()
         .persistent()
-        .set(&ThresholdKey::Config, &config);
+        .set(&persistent_key(ThresholdKey::Config), &config);
 
     let metrics = WindowMetrics::new(env.ledger().timestamp());
     env.storage()
         .persistent()
-        .set(&ThresholdKey::CurrentMetrics, &metrics);
+        .set(&persistent_key(ThresholdKey::CurrentMetrics), &metrics);
 
     env.storage()
         .persistent()
-        .set(&ThresholdKey::CooldownMultiplier, &1u32);
+        .set(&persistent_key(ThresholdKey::CooldownMultiplier), &1u32);
 
     emit_config_event(env, symbol_short!("th_init"), &config);
 }
@@ -169,7 +205,7 @@ pub fn set_threshold_config(env: &Env, config: ThresholdConfig) -> Result<(), u3
     // Store new configuration
     env.storage()
         .persistent()
-        .set(&ThresholdKey::Config, &config);
+        .set(&persistent_key(ThresholdKey::Config), &config);
 
     // Emit configuration update event
     emit_config_update_event(env, &prev_config, &config);
@@ -181,7 +217,7 @@ pub fn set_threshold_config(env: &Env, config: ThresholdConfig) -> Result<(), u3
 pub fn get_threshold_config(env: &Env) -> ThresholdConfig {
     env.storage()
         .persistent()
-        .get(&ThresholdKey::Config)
+        .get(&persistent_key(ThresholdKey::Config))
         .unwrap_or(ThresholdConfig::default())
 }
 
@@ -198,7 +234,7 @@ pub fn record_operation_success(env: &Env) {
 
     env.storage()
         .persistent()
-        .set(&ThresholdKey::CurrentMetrics, &metrics);
+        .set(&persistent_key(ThresholdKey::CurrentMetrics), &metrics);
 }
 
 /// Record a failed operation
@@ -210,7 +246,7 @@ pub fn record_operation_failure(env: &Env) {
 
     env.storage()
         .persistent()
-        .set(&ThresholdKey::CurrentMetrics, &metrics);
+        .set(&persistent_key(ThresholdKey::CurrentMetrics), &metrics);
 }
 
 /// Record an outflow transaction
@@ -226,14 +262,14 @@ pub fn record_outflow(env: &Env, amount: i128) {
 
     env.storage()
         .persistent()
-        .set(&ThresholdKey::CurrentMetrics, &metrics);
+        .set(&persistent_key(ThresholdKey::CurrentMetrics), &metrics);
 }
 
 /// Get current window metrics
 pub fn get_current_metrics(env: &Env) -> WindowMetrics {
     env.storage()
         .persistent()
-        .get(&ThresholdKey::CurrentMetrics)
+        .get(&persistent_key(ThresholdKey::CurrentMetrics))
         .unwrap_or_else(|| WindowMetrics::new(env.ledger().timestamp()))
 }
 
@@ -243,13 +279,13 @@ fn rotate_window_if_needed(env: &Env) {
     let metrics = get_current_metrics(env);
     let now = env.ledger().timestamp();
 
-    let window_end = metrics.window_start + config.time_window_secs;
+    let window_end = metrics.window_start + config.time_window_secs();
 
     if now >= window_end {
         // Archive current metrics
         env.storage()
             .persistent()
-            .set(&ThresholdKey::PreviousMetrics, &metrics);
+            .set(&persistent_key(ThresholdKey::PreviousMetrics), &metrics);
 
         // Emit window rotation event
         emit_window_rotation_event(env, &metrics);
@@ -258,7 +294,7 @@ fn rotate_window_if_needed(env: &Env) {
         let new_metrics = WindowMetrics::new(now);
         env.storage()
             .persistent()
-            .set(&ThresholdKey::CurrentMetrics, &new_metrics);
+            .set(&persistent_key(ThresholdKey::CurrentMetrics), &new_metrics);
     }
 }
 
@@ -275,10 +311,10 @@ pub fn check_thresholds(env: &Env) -> Result<(), ThresholdBreach> {
     let now = env.ledger().timestamp();
 
     // Check failure rate threshold
-    if metrics.failure_count >= config.failure_rate_threshold {
+    if metrics.failure_count >= config.failure_rate_threshold() {
         let breach = ThresholdBreach {
             metric_type: symbol_short!("failure"),
-            threshold_value: config.failure_rate_threshold as i128,
+            threshold_value: config.failure_rate_threshold() as i128,
             actual_value: metrics.failure_count as i128,
             timestamp: now,
             breach_count: metrics.breach_count + 1,
@@ -342,7 +378,7 @@ pub fn is_cooldown_active(env: &Env) -> bool {
     let last_cooldown_end: u64 = env
         .storage()
         .persistent()
-        .get(&ThresholdKey::LastCooldownEnd)
+        .get(&persistent_key(ThresholdKey::LastCooldownEnd))
         .unwrap_or(0);
 
     let now = env.ledger().timestamp();
@@ -353,7 +389,7 @@ pub fn is_cooldown_active(env: &Env) -> bool {
 pub fn get_cooldown_multiplier(env: &Env) -> u32 {
     env.storage()
         .persistent()
-        .get(&ThresholdKey::CooldownMultiplier)
+        .get(&persistent_key(ThresholdKey::CooldownMultiplier))
         .unwrap_or(1)
 }
 
@@ -363,30 +399,30 @@ pub fn apply_cooldown(env: &Env) {
     let multiplier = get_cooldown_multiplier(env);
     let now = env.ledger().timestamp();
 
-    let cooldown_duration = config.cooldown_period_secs * (multiplier as u64);
+    let cooldown_duration = config.cooldown_period_secs() * (multiplier as u64);
     let cooldown_end = now + cooldown_duration;
 
     env.storage()
         .persistent()
-        .set(&ThresholdKey::LastCooldownEnd, &cooldown_end);
+        .set(&persistent_key(ThresholdKey::LastCooldownEnd), &cooldown_end);
 }
 
 /// Increase cooldown multiplier for repeated breaches
 pub fn increase_cooldown_multiplier(env: &Env) {
     let config = get_threshold_config(env);
     let current_multiplier = get_cooldown_multiplier(env);
-    let new_multiplier = current_multiplier * config.cooldown_multiplier;
+    let new_multiplier = current_multiplier * config.cooldown_multiplier();
 
     env.storage()
         .persistent()
-        .set(&ThresholdKey::CooldownMultiplier, &new_multiplier);
+        .set(&persistent_key(ThresholdKey::CooldownMultiplier), &new_multiplier);
 }
 
 /// Reset cooldown multiplier after stability period
 pub fn reset_cooldown_multiplier(env: &Env) {
     env.storage()
         .persistent()
-        .set(&ThresholdKey::CooldownMultiplier, &1u32);
+        .set(&persistent_key(ThresholdKey::CooldownMultiplier), &1u32);
 }
 
 // ─────────────────────────────────────────────────────────
@@ -401,7 +437,7 @@ pub fn reset_metrics(env: &Env, admin: &Address) {
     let new_metrics = WindowMetrics::new(now);
     env.storage()
         .persistent()
-        .set(&ThresholdKey::CurrentMetrics, &new_metrics);
+        .set(&persistent_key(ThresholdKey::CurrentMetrics), &new_metrics);
 
     // Emit reset event
     emit_metrics_reset_event(env, admin, now);
@@ -429,10 +465,10 @@ fn emit_config_event(env: &Env, event_type: Symbol, config: &ThresholdConfig) {
     env.events().publish(
         (symbol_short!("th_cfg"), event_type),
         (
-            config.failure_rate_threshold,
+            config.failure_rate_threshold(),
             config.outflow_volume_threshold,
             config.max_single_payout,
-            config.time_window_secs,
+            config.time_window_secs(),
         ),
     );
 }
@@ -442,8 +478,8 @@ fn emit_config_update_event(env: &Env, prev: &ThresholdConfig, new: &ThresholdCo
     env.events().publish(
         (symbol_short!("th_cfg"), symbol_short!("update")),
         (
-            prev.failure_rate_threshold,
-            new.failure_rate_threshold,
+            prev.failure_rate_threshold(),
+            new.failure_rate_threshold(),
             prev.outflow_volume_threshold,
             new.outflow_volume_threshold,
         ),

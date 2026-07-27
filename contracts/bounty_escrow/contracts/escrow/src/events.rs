@@ -999,6 +999,35 @@ pub fn emit_participant_filter_queried(env: &Env, event: ParticipantFilterQuerie
     env.events().publish(topics, event);
 }
 
+/// Emitted once during `init()` to record the participant list storage schema
+/// version. This covers the allowlist/blocklist index layout used by the
+/// paginated participant filter views.
+///
+/// ### Topics
+/// | Index | Value |
+/// |-------|-------|
+/// | 0 | `"pf_schema"` |
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ParticipantListSchemaVersionSet {
+    pub version: u32,
+    /// Participant list schema version written to instance storage.
+    pub schema_version: u32,
+    /// Admin that initialized the contract.
+    pub set_by: Address,
+    /// Ledger timestamp.
+    pub timestamp: u64,
+}
+
+/// Emit [`ParticipantListSchemaVersionSet`].
+pub fn emit_participant_list_schema_version_set(
+    env: &Env,
+    event: ParticipantListSchemaVersionSet,
+) {
+    let topics = (symbol_short!("pf_schema"),);
+    env.events().publish(topics, event);
+}
+
 // ═══════════════════════════════════════════════════════════════════════════════
 // RISK FLAG EVENTS
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -1404,6 +1433,35 @@ pub struct GasBudgetCapApproached {
     pub cpu_cap: u64,
     pub mem_cap: u64,
     pub threshold_bps: u32,
+    pub timestamp: u64,
+}
+
+/// Published by `get_gas_budget_advisory_status` when non-zero caps are
+/// configured on a production (non-testutils) build.
+///
+/// The presence of this event in the on-chain stream signals that
+/// `GasBudgetConfig` caps are **advisory-only**: they are stored and
+/// observable but not measured or enforced at runtime.
+///
+/// ### Topics
+/// | Index | Value |
+/// |-------|-------|
+/// | 0 | `"gas_adv"` |
+///
+/// ### Security note
+/// `caps_enforced_in_production` is always `false` in a production WASM build.
+/// Auditors should treat any deployment where `caps_configured = true` and
+/// `caps_enforced_in_production = false` as effectively uncapped at runtime.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct GasBudgetAdvisoryNotice {
+    /// Always `false` on the live network; `true` only under `testutils`.
+    pub caps_enforced_in_production: bool,
+    /// At least one operation has a non-zero CPU or memory cap configured.
+    pub caps_configured: bool,
+    /// The `GasBudgetConfig::enforce` flag as stored.
+    pub enforce_flag_set: bool,
+    /// Ledger timestamp when the advisory was emitted.
     pub timestamp: u64,
 }
 
@@ -2017,5 +2075,23 @@ pub struct ReentrancyGuardAcquired {
 
 pub fn emit_reentrancy_guard_acquired(env: &Env, event: ReentrancyGuardAcquired) {
     let topics = (symbol_short!("rg_acq"),);
+    env.events().publish(topics, event);
+}
+
+// ============================================================================
+// Released With Conversion Event
+// ============================================================================
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReleasedWithConversion {
+    pub escrow_id: u64,
+    pub src_asset: soroban_sdk::Address,
+    pub dest_asset: soroban_sdk::Address,
+    pub rate: i128,
+}
+
+pub fn emit_released_with_conversion(env: &Env, event: ReleasedWithConversion) {
+    let topics = (symbol_short!("conv"), event.escrow_id);
     env.events().publish(topics, event);
 }

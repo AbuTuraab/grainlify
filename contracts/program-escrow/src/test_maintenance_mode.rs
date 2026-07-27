@@ -41,7 +41,7 @@ fn setup_program_with_admin<'a>(
         &None,
         &None,
     );
-    client.publish_program();
+    client.publish_program(&program_id, &admin);
     (client, admin, payout_key, token_client)
 }
 
@@ -139,7 +139,7 @@ fn test_emergency_withdraw_allowed_in_maintenance_mode() {
 
     // Enable maintenance mode (also need to set lock_paused for emergency_withdraw)
     contract.set_maintenance_mode(&true);
-    contract.set_paused(&Some(true), &None, &None, &None); // Set lock_paused to enable emergency withdraw
+    contract.set_paused(&Some(true), &None, &None, &None, &None); // Set lock_paused to enable emergency withdraw
 
     // Emergency withdraw should succeed during maintenance mode
     let withdraw_recipient = Address::generate(&env);

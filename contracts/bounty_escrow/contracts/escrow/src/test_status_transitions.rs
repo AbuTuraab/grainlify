@@ -124,6 +124,23 @@ fn authorize_contract_call(
     }]);
 }
 
+fn has_event_topic(env: &Env, topic: &str) -> bool {
+    let expected = Symbol::new(env, topic);
+    env.events().all().iter().any(|(_, topics, _)| {
+        topics.len() >= 1
+            && topics
+                .get(0)
+                .and_then(|t| {
+                    <Symbol as soroban_sdk::TryFromVal<Env, soroban_sdk::Val>>::try_from_val(
+                        env, &t,
+                    )
+                    .ok()
+                })
+                .map(|s| s == expected)
+                .unwrap_or(false)
+    })
+}
+
 #[test]
 fn test_refund_eligibility_ineligible_before_deadline_without_approval() {
     let setup = TestSetup::new();
@@ -186,6 +203,157 @@ fn test_refund_eligibility_eligible_with_admin_approval_before_deadline() {
     assert_eq!(view.amount, 500);
     assert_eq!(view.recipient, Some(custom_recipient));
     assert!(view.approval_present);
+}
+
+#[test]
+fn test_refund_eligibility_view_reports_not_found_without_auth() {
+    let setup = TestSetup::new();
+    let view = setup.escrow.get_refund_eligibility_view(&404_u64);
+
+    assert!(!view.eligible);
+    assert_eq!(view.code, RefundEligibilityCode::IneligibleBountyNotFound);
+    assert_eq!(view.bounty_id, 404);
+    assert_eq!(view.amount, 0);
+    assert_eq!(view.deadline, 0);
+    assert_eq!(view.recipient, None);
+    assert!(!view.approval_present);
+}
+
+#[test]
+fn test_refund_eligibility_view_reports_invalid_status_after_release() {
+    let setup = TestSetup::new();
+    let bounty_id = 102;
+    let amount = 1_000;
+    let deadline = setup.env.ledger().timestamp() + 500;
+
+    setup
+        .escrow
+        .lock_funds(&setup.depositor, &bounty_id, &amount, &deadline);
+    setup.escrow.release_funds(&bounty_id, &setup.contributor);
+
+    let view = setup.escrow.get_refund_eligibility_view(&bounty_id);
+    assert!(!view.eligible);
+    assert_eq!(view.code, RefundEligibilityCode::IneligibleInvalidStatus);
+    assert_eq!(view.deadline, deadline);
+    assert_eq!(view.amount, 0);
+}
+
+#[test]
+fn test_refund_eligibility_schema_version_is_initialized() {
+    let setup = TestSetup::new();
+    assert_eq!(setup.escrow.get_refund_schema_version(), 1);
+}
+
+#[test]
+fn test_participant_filter_schema_version_is_initialized_and_audited() {
+    let setup = TestSetup::new();
+
+    assert_eq!(setup.escrow.get_participant_schema_version(), 1);
+    assert!(has_event_topic(&setup.env, "pf_schema"));
+}
+
+#[test]
+fn test_participant_filter_whitelist_pagination_counts_and_has_more() {
+    let setup = TestSetup::new();
+    let first = Address::generate(&setup.env);
+    let second = Address::generate(&setup.env);
+    let third = Address::generate(&setup.env);
+
+    setup.escrow.set_whitelist_entry(&first, &true);
+    setup.escrow.set_whitelist_entry(&second, &true);
+    setup.escrow.set_whitelist_entry(&third, &true);
+    setup.escrow.set_whitelist_entry(&first, &true);
+
+    assert_eq!(setup.escrow.get_whitelist_count(), 3);
+
+    let page1 = setup.escrow.query_whitelist(&0, &2);
+    assert_eq!(page1.items.len(), 2);
+    assert_eq!(page1.total, 3);
+    assert_eq!(page1.offset, 0);
+    assert!(page1.has_more);
+
+    let page2 = setup.escrow.query_whitelist(&2, &2);
+    assert_eq!(page2.items.len(), 1);
+    assert_eq!(page2.total, 3);
+    assert_eq!(page2.offset, 2);
+    assert!(!page2.has_more);
+    assert!(has_event_topic(&setup.env, "pf_query"));
+}
+
+#[test]
+fn test_participant_filter_pagination_caps_limit_and_handles_extreme_offsets() {
+    let setup = TestSetup::new();
+
+    for _ in 0..55 {
+        let address = Address::generate(&setup.env);
+        setup.escrow.set_whitelist_entry(&address, &true);
+    }
+
+    let capped = setup.escrow.query_whitelist(&0, &999);
+    assert_eq!(capped.items.len(), 50);
+    assert_eq!(capped.total, 55);
+    assert!(capped.has_more);
+
+    let empty = setup.escrow.query_whitelist(&u32::MAX, &10);
+    assert_eq!(empty.items.len(), 0);
+    assert_eq!(empty.total, 55);
+    assert_eq!(empty.offset, u32::MAX);
+    assert!(!empty.has_more);
+
+    let zero_limit = setup.escrow.query_whitelist(&0, &0);
+    assert_eq!(zero_limit.items.len(), 0);
+    assert_eq!(zero_limit.total, 55);
+    assert!(zero_limit.has_more);
+}
+
+#[test]
+fn test_participant_filter_blocklist_pagination_removal_and_audit_event() {
+    let setup = TestSetup::new();
+    let first = Address::generate(&setup.env);
+    let second = Address::generate(&setup.env);
+
+    setup.escrow.set_blocklist_entry(&first, &true);
+    setup.escrow.set_blocklist_entry(&second, &true);
+    setup.escrow.set_blocklist_entry(&first, &false);
+
+    assert_eq!(setup.escrow.get_blocklist_count(), 1);
+
+    let page = setup.escrow.query_blocklist(&0, &10);
+    assert_eq!(page.items.len(), 1);
+    assert_eq!(page.total, 1);
+    assert!(!page.has_more);
+    assert!(has_event_topic(&setup.env, "pf_query"));
+}
+
+#[test]
+fn test_refund_approval_audit_events_and_consumption() {
+    let setup = TestSetup::new();
+    let bounty_id = 103;
+    let amount = 1_500;
+    let deadline = setup.env.ledger().timestamp() + 1_000;
+
+    setup
+        .escrow
+        .lock_funds(&setup.depositor, &bounty_id, &amount, &deadline);
+    setup
+        .escrow
+        .approve_refund(&bounty_id, &600, &setup.depositor, &RefundMode::Partial);
+    assert!(has_event_topic(&setup.env, "r_appr"));
+
+    setup.escrow.refund(&bounty_id);
+    assert!(has_event_topic(&setup.env, "r_apcns"));
+
+    let view = setup.escrow.get_refund_eligibility_view(&bounty_id);
+    assert!(!view.eligible);
+    assert_eq!(
+        view.code,
+        RefundEligibilityCode::IneligibleDeadlineNotPassed
+    );
+    assert_eq!(view.amount, 0);
+    assert!(!view.approval_present);
+
+    let legacy = setup.escrow.get_refund_eligibility(&bounty_id);
+    assert_eq!(legacy.3, None);
 }
 
 /// Maintenance mode halts ALL state-mutating operations globally (lock, release, refund).
@@ -322,7 +490,7 @@ fn test_partially_refunded_to_refunded() {
 
 // Invalid transition: Released → Locked
 #[test]
-#[should_panic(expected = "Error(Contract, #201)")]
+#[should_panic(expected = "Error(Contract, #55)")]
 fn test_released_to_locked_fails() {
     let setup = TestSetup::new();
     let bounty_id = 1;
@@ -341,7 +509,7 @@ fn test_released_to_locked_fails() {
 
 // Invalid transition: Released → Released
 #[test]
-#[should_panic(expected = "Error(Contract, #203)")]
+#[should_panic(expected = "Error(Contract, #57)")]
 fn test_released_to_released_fails() {
     let setup = TestSetup::new();
     let bounty_id = 1;
@@ -358,7 +526,7 @@ fn test_released_to_released_fails() {
 
 // Invalid transition: Released → Refunded
 #[test]
-#[should_panic(expected = "Error(Contract, #203)")]
+#[should_panic(expected = "Error(Contract, #57)")]
 fn test_released_to_refunded_fails() {
     let setup = TestSetup::new();
     let bounty_id = 1;
@@ -376,7 +544,7 @@ fn test_released_to_refunded_fails() {
 
 // Invalid transition: Released → PartiallyRefunded
 #[test]
-#[should_panic(expected = "Error(Contract, #203)")]
+#[should_panic(expected = "Error(Contract, #57)")]
 fn test_released_to_partially_refunded_fails() {
     let setup = TestSetup::new();
     let bounty_id = 1;
@@ -396,7 +564,7 @@ fn test_released_to_partially_refunded_fails() {
 
 // Invalid transition: Refunded → Locked
 #[test]
-#[should_panic(expected = "Error(Contract, #201)")]
+#[should_panic(expected = "Error(Contract, #55)")]
 fn test_refunded_to_locked_fails() {
     let setup = TestSetup::new();
     let bounty_id = 1;
@@ -425,7 +593,7 @@ fn test_refunded_to_locked_fails() {
 
 // Invalid transition: Refunded → Released
 #[test]
-#[should_panic(expected = "Error(Contract, #203)")]
+#[should_panic(expected = "Error(Contract, #57)")]
 fn test_refunded_to_released_fails() {
     let setup = TestSetup::new();
     let bounty_id = 1;
@@ -452,7 +620,7 @@ fn test_refunded_to_released_fails() {
 
 // Invalid transition: Refunded → Refunded
 #[test]
-#[should_panic(expected = "Error(Contract, #203)")]
+#[should_panic(expected = "Error(Contract, #57)")]
 fn test_refunded_to_refunded_fails() {
     let setup = TestSetup::new();
     let bounty_id = 1;
@@ -479,7 +647,7 @@ fn test_refunded_to_refunded_fails() {
 
 // Invalid transition: Refunded → PartiallyRefunded
 #[test]
-#[should_panic(expected = "Error(Contract, #203)")]
+#[should_panic(expected = "Error(Contract, #57)")]
 fn test_refunded_to_partially_refunded_fails() {
     let setup = TestSetup::new();
     let bounty_id = 1;
@@ -508,7 +676,7 @@ fn test_refunded_to_partially_refunded_fails() {
 
 // Invalid transition: PartiallyRefunded → Locked
 #[test]
-#[should_panic(expected = "Error(Contract, #201)")]
+#[should_panic(expected = "Error(Contract, #55)")]
 fn test_partially_refunded_to_locked_fails() {
     let setup = TestSetup::new();
     let bounty_id = 1;
@@ -530,7 +698,7 @@ fn test_partially_refunded_to_locked_fails() {
 
 // Invalid transition: PartiallyRefunded → Released
 #[test]
-#[should_panic(expected = "Error(Contract, #203)")]
+#[should_panic(expected = "Error(Contract, #57)")]
 fn test_partially_refunded_to_released_fails() {
     let setup = TestSetup::new();
     let bounty_id = 1;
@@ -578,7 +746,7 @@ fn test_update_risk_flags_success() {
 }
 
 #[test]
-#[should_panic(expected = "Error(Contract, #202)")]
+#[should_panic(expected = "Error(Contract, #56)")]
 fn test_update_risk_flags_bounty_not_found() {
     let setup = TestSetup::new();
     let missing_bounty_id = 999;
@@ -588,7 +756,7 @@ fn test_update_risk_flags_bounty_not_found() {
 }
 
 #[test]
-#[should_panic(expected = "Error(Contract, #202)")]
+#[should_panic(expected = "Error(Contract, #56)")]
 fn test_get_risk_flags_bounty_not_found() {
     let setup = TestSetup::new();
     let missing_bounty_id = 999;
@@ -1025,17 +1193,10 @@ fn test_set_batch_size_caps_success() {
 fn test_set_batch_size_caps_emits_event() {
     let setup = TestSetup::new();
     setup.escrow.set_batch_size_caps(&4_u32, &2_u32);
-    let events = setup.env.events().all();
-    let found = events.iter().any(|(_, topics, _)| {
-        topics.len() >= 1
-            && topics
-                .get(0)
-                .map(|t| {
-                    t == soroban_sdk::Symbol::new(&setup.env, "bcapcfg").into_val(&setup.env)
-                })
-                .unwrap_or(false)
-    });
-    assert!(found, "BatchSizeCapsUpdated event not emitted");
+    assert!(
+        has_event_topic(&setup.env, "bcapcfg"),
+        "BatchSizeCapsUpdated event not emitted"
+    );
 }
 
 // --- set_batch_size_caps: boundary values ---
