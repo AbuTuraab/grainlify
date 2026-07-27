@@ -4248,6 +4248,12 @@ impl ProgramEscrowContract {
     }
 
     /// Set a delegate for a program with specific permissions.
+    ///
+    /// ### Controller Rotation Interaction
+    /// Reassigning a delegate while a `propose_controller` rotation is pending
+    /// is explicitly permitted. This operation does **not** invalidate the pending
+    /// rotation. Any delegate set here will carry over and remain active even
+    /// after the new controller accepts the role.
     pub fn set_program_delegate(
         env: Env,
         program_id: String,
@@ -4390,6 +4396,12 @@ impl ProgramEscrowContract {
 
     /// Propose a new controller (authorized_payout_key) for a program (step 1).
     /// Current controller or admin must authorize. Returns explicit errors for deterministic behavior.
+    ///
+    /// ### Delegate Interaction
+    /// Proposing a controller does not affect existing delegates. Furthermore,
+    /// the outgoing controller retains full authority (including the ability
+    /// to reassign the delegate via `set_program_delegate`) until the rotation
+    /// is accepted.
     pub fn propose_controller(
         env: Env,
         program_id: String,
@@ -4455,6 +4467,12 @@ impl ProgramEscrowContract {
 
     /// Accept the proposed controller role for a program (step 2).
     /// The proposed controller must authorize. Returns explicit errors for deterministic behavior.
+    ///
+    /// ### Delegate Carryover
+    /// When a rotation is accepted, the previously-assigned delegate and their
+    /// permissions **carry over** and remain active. The incoming controller
+    /// inherits the existing delegate and is responsible for reviewing and
+    /// revoking them if their authority is no longer desired.
     ///
     /// ### Timelock
     /// A mandatory 24-hour delay (`ROTATION_TIMELOCK_DELAY`) must elapse between
