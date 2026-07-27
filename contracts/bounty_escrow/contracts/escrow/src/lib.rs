@@ -6,12 +6,10 @@ mod invariants;
 mod multitoken_invariants;
 mod reentrancy_guard;
 // Pre-existing broken test modules excluded from compilation until their referenced types/methods are implemented:
-#[cfg(test)]
-// mod test_boundary_edge_cases; // Issue #1294: PartiallyRefunded accounting tests
+// #[cfg(test)] mod test_boundary_edge_cases; // Issue #1294: PartiallyRefunded accounting tests
 // #[cfg(test)] mod test_cross_contract_interface; // pre-existing breakage: references unimplemented methods
 // #[cfg(test)] mod test_deterministic_randomness;
 // #[cfg(test)] mod test_multi_region_treasury;
-// #[cfg(test)] mod test_multi_token_fees;
 // #[cfg(test)] mod test_rbac;
 // #[cfg(test)] mod test_renew_rollover;
 // #[cfg(test)] mod test_risk_flags;
@@ -24,6 +22,8 @@ mod capability_replay_tests;
 mod test_fee_on_transfer;
 #[cfg(test)]
 mod test_filter_pagination;
+#[cfg(test)]
+mod test_multi_token_fees;
 // #[cfg(test)] mod test_frozen_balance; // pre-existing SDK/API drift blocks filtered test builds
 #[cfg(test)]
 mod test_reentrancy_guard;
@@ -50,8 +50,8 @@ use crate::events::{
 };
 use soroban_sdk::xdr::ToXdr;
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, symbol_short, token, vec, Address, Bytes,
-    BytesN, Env, String, Symbol, Vec,
+    contract, contractclient, contracterror, contractimpl, contracttype, symbol_short, token, vec,
+    Address, Bytes, BytesN, Env, String, Symbol, Vec,
 };
 
 // ============================================================================
@@ -553,7 +553,10 @@ pub enum ReleaseType {
 }
 
 use grainlify_core::errors;
-#[contracterror]
+// `export = false`: the XDR contract spec caps UDT enums at 50 cases and this
+// enum has grown past that, so spec generation panics (LengthExceedsMax).
+// Conversion impls are still generated; only the spec entry is omitted.
+#[contracterror(export = false)]
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
 #[repr(u32)]
 pub enum Error {
@@ -842,7 +845,9 @@ pub struct PendingAdminRotation {
     pub proposed_by: Address,
 }
 
-#[contracttype]
+// `export = false`: same 50-case XDR spec limit as `Error` above; storage keys
+// are internal so the spec entry is not needed by external tooling anyway.
+#[contracttype(export = false)]
 pub enum DataKey {
     Admin,
     Token,
@@ -3615,16 +3620,39 @@ impl BountyEscrowContract {
         Self::load_capability(&env, capability_id.clone())
     }
 
-    /// Get current fee configuration (view function)
+    /// Get the current **global** fee configuration (view function).
+    ///
+    /// # Precedence
+    /// The global config is the fallback used when no per-token
+    /// `TokenFeeConfig` exists for the escrow token, and its `fee_enabled`
+    /// flag is the **master kill-switch**: when `false`, no fee is charged
+    /// for *any* token — even one with an active per-token override whose
+    /// own `fee_enabled` is `true`. The effective flag is
+    /// `global.fee_enabled AND token.fee_enabled` (see `resolve_fee_config`
+    /// and [`Self::set_token_fee_config`]).
+    ///
+    /// Note: this returns the stored global config as-is; it does not apply
+    /// any per-token override. Use `get_token_fee_config` to inspect a
+    /// token's override.
     pub fn get_fee_config(env: Env) -> FeeConfig {
         Self::get_fee_config_internal(&env)
     }
 
     /// Set a per-token fee configuration (admin only).
     ///
-    /// When a `TokenFeeConfig` is set for a given token address it takes
-    /// precedence over the global `FeeConfig` for all escrows denominated
-    /// in that token.
+    /// When a `TokenFeeConfig` is set for a given token address, its rate,
+    /// fixed-fee, and recipient fields take precedence over the global
+    /// `FeeConfig` for all escrows denominated in that token.  However, its
+    /// `fee_enabled` flag is **AND-ed** with the global kill-switch
+    /// (`FeeConfig.fee_enabled`): the per-token flag can only *further
+    /// restrict* fee collection — it can **never** re-enable fees when the
+    /// global kill-switch is `false`.
+    ///
+    /// # Precedence (resolved in `resolve_fee_config`)
+    /// 1. Global `FeeConfig.fee_enabled` — master kill-switch.
+    /// 2. `TokenFeeConfig.token` — rate/fixed/recipient overrides, but
+    ///    `fee_enabled` is AND-ed with the global flag.
+    /// 3. Global `FeeConfig` fallback — used when no per-token override exists.
     ///
     /// # Arguments
     /// * `token`            – the token contract address this config applies to
@@ -3632,7 +3660,7 @@ impl BountyEscrowContract {
     /// * `release_fee_rate` – fee rate on release in basis points (0 – 5 000)
     /// * `lock_fixed_fee` / `release_fixed_fee` – flat fees in token units (≥ 0)
     /// * `fee_recipient`    – address that receives fees for this token
-    /// * `fee_enabled`      – whether fee collection is active
+    /// * `fee_enabled`      – whether fee collection is active for this token
     ///
     /// # Errors
     /// * `NotInitialized`  – contract not yet initialised
@@ -3691,8 +3719,28 @@ impl BountyEscrowContract {
 
     /// Internal: resolve the effective fee config for the escrow token.
     ///
-    /// Precedence: `TokenFeeConfig(token)` > global `FeeConfig`.
+    /// # Precedence (global kill-switch first)
+    ///
+    /// 1. **Global `FeeConfig.fee_enabled`** is the master kill-switch.
+    ///    When `false`, no fees are collected for *any* token, regardless of
+    ///    any per-token `TokenFeeConfig` override. This lets an admin halt all
+    ///    fee collection in a single operation without needing to clear every
+    ///    per-token config.
+    ///
+    /// 2. **`TokenFeeConfig(token)`** — when present, its rate/fixed/recipient
+    ///    fields override the global `FeeConfig` for that specific token.
+    ///    However, its `fee_enabled` is **AND-ed** with the global
+    ///    `fee_enabled`: the per-token flag can only *further restrict* fee
+    ///    collection (i.e. disable it for that token), never re-enable it
+    ///    when the global kill-switch is off.
+    ///
+    /// 3. **Global `FeeConfig` fallback** — used when no per-token override
+    ///    exists.
+    ///
+    /// # Returns
+    /// `(lock_fee_rate, release_fee_rate, lock_fixed_fee, release_fixed_fee, fee_recipient, fee_enabled)`
     fn resolve_fee_config(env: &Env) -> (i128, i128, i128, i128, Address, bool) {
+        let global = Self::get_fee_config_internal(env);
         let token_addr: Address = env.storage().instance().get(&DataKey::Token).unwrap();
         if let Some(tok_cfg) = env
             .storage()
@@ -3705,10 +3753,11 @@ impl BountyEscrowContract {
                 tok_cfg.lock_fixed_fee,
                 tok_cfg.release_fixed_fee,
                 tok_cfg.fee_recipient,
-                tok_cfg.fee_enabled,
+                // Global kill-switch AND per-token flag: the global can only
+                // disable fees; the per-token flag can only further restrict.
+                global.fee_enabled && tok_cfg.fee_enabled,
             )
         } else {
-            let global = Self::get_fee_config_internal(env);
             (
                 global.lock_fee_rate,
                 global.release_fee_rate,
@@ -4849,9 +4898,16 @@ impl BountyEscrowContract {
 
         let router_client = RouterClient::new(&env, &router_address);
 
-        // Approve router to spend net_payout of source asset from contract
+        // Approve router to spend net_payout of source asset from contract.
+        // `approve` expects an expiration *ledger sequence* (u32), not a timestamp.
         let deadline = env.ledger().timestamp() + 300;
-        client.approve(&env.current_contract_address(), &router_address, &net_payout, &deadline);
+        let approve_expiration_ledger = env.ledger().sequence() + 100;
+        client.approve(
+            &env.current_contract_address(),
+            &router_address,
+            &net_payout,
+            &approve_expiration_ledger,
+        );
 
         // Query the router for the expected amount out to validate slippage
         let amounts_out = router_client.get_amounts_out(&net_payout, &path);
