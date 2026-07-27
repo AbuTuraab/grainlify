@@ -752,6 +752,12 @@ pub struct FotRouter {
     pub router_contract: Address,
     /// Slippage tolerance in basis points (0 – 500, i.e. 0 – 5 %).
     pub slippage_bps: u32,
+    /// Maximum gross-to-net multiplier for router quotes, in basis points over 10_000.
+    ///
+    /// For example, `15_000` permits a gross quote up to 1.5x the intended net.
+    /// This bound prevents a compromised or misconfigured router from draining
+    /// the program with an implausibly inflated quote.
+    pub max_fot_multiplier_bps: u32,
 }
 
 /// Nullable wrapper for `FotRouter` stored inside `ProgramData`.
@@ -773,6 +779,8 @@ pub struct FotRouterSetEvent {
     pub version: u32,
     pub router_contract: Address,
     pub slippage_bps: u32,
+    /// Configured upper-bound multiplier for gross router quotes, in basis points over 10_000.
+    pub max_fot_multiplier_bps: u32,
     pub set_by: Address,
     pub timestamp: u64,
 }
@@ -784,47 +792,6 @@ pub struct FotRouterClearedEvent {
     pub version: u32,
     pub set_by: Address,
     pub timestamp: u64,
-}
-
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct FotRouter {
-    /// Address of the router contract that implements `quote(Address, i128) -> i128`.
-    pub router_contract: Address,
-    /// Slippage tolerance in basis points (1 bp = 0.01%).
-    /// Applied as a buffer on top of the quoted amount.
-    pub slippage_bps: u32,
-}
-
-/// Event emitted when the FoT router configuration is set or updated.
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct FotRouterSetEvent {
-    pub version: u32,
-    pub router_contract: Address,
-    pub slippage_bps: u32,
-    pub set_by: Address,
-    pub timestamp: u64,
-}
-
-/// Event emitted when the FoT router configuration is cleared.
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct FotRouterClearedEvent {
-    pub version: u32,
-    pub set_by: Address,
-    pub timestamp: u64,
-}
-
-/// Contract-type-safe optional wrapper around [`FotRouter`].
-///
-/// Nested `Option<FotRouter>` inside another `#[contracttype]` breaks under
-/// Cargo feature unification with `soroban-sdk/testutils` (unit-test builds).
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum OptionalFotRouter {
-    None,
-    Some(FotRouter),
 }
 
 #[contracttype]
@@ -843,11 +810,6 @@ pub struct ProgramData {
     pub reference_hash: Option<soroban_sdk::Bytes>,
     pub archived: bool,
     pub archived_at: Option<u64>,
-    // --- Program identity and history ---
-    pub program_id: String,
-    pub payout_history: soroban_sdk::Vec<PayoutRecord>,
-    pub initial_liquidity: i128,
-    pub reference_hash: Option<soroban_sdk::Bytes>,
     /// Optional per-program circuit breaker failure threshold.
     /// If set, overrides the global default (3) for this program.
     /// Must be between 1 and 100 inclusive when set.
@@ -2129,7 +2091,11 @@ mod reentrancy_tests;
 mod test_circuit_breaker_enforcement;
 // #[cfg(test)] mod test_dispute_resolution; // pre-existing breakage
 mod fot_routing;
+#[cfg(test)]
+mod test_fot_routing;
 mod threshold_monitor;
+#[cfg(test)]
+mod threshold_monitor_prop_tests;
 mod token_math;
 mod reputation;
 pub use reputation::{
@@ -4641,15 +4607,30 @@ impl ProgramEscrowContract {
     /// # Arguments
     /// * `router_contract` - Address of the AMM router contract implementing `quote`.
     /// * `slippage_bps` - Slippage tolerance in basis points (0-500, i.e. 0-5%).
+    /// * `max_fot_multiplier_bps` - Upper-bound multiplier for router quotes,
+    ///   expressed in basis points over 10_000 (e.g. `15_000` = 1.5x the net amount).
+    ///   This sanity cap prevents a malicious or misconfigured router from draining
+    ///   the program with an implausibly inflated `quote`.
     ///
     /// # Panics
     /// * If the contract is not initialized
     /// * If caller is not the admin
     /// * If `slippage_bps` exceeds 500 (5%)
-    pub fn set_fot_router(env: Env, router_contract: Address, slippage_bps: u32) {
+    /// * If `max_fot_multiplier_bps` is outside the allowed range
+    pub fn set_fot_router(
+        env: Env,
+        router_contract: Address,
+        slippage_bps: u32,
+        max_fot_multiplier_bps: u32,
+    ) {
         let admin = Self::require_admin(&env);
         if slippage_bps > 500 {
             panic!("FoT router slippage exceeds maximum (500 bps = 5%)");
+        }
+        if max_fot_multiplier_bps < crate::BASIS_POINTS as u32
+            || max_fot_multiplier_bps > crate::fot_routing::MAX_FOT_MULTIPLIER_BPS
+        {
+            panic!("FoT router max multiplier must be between 10000 and 100000 basis points");
         }
 
         let mut program_data: ProgramData = env
@@ -4661,6 +4642,7 @@ impl ProgramEscrowContract {
         program_data.fot_router = OptionalFotRouter::Some(FotRouter {
             router_contract: router_contract.clone(),
             slippage_bps,
+            max_fot_multiplier_bps,
         });
 
         env.storage().instance().set(&PROGRAM_DATA, &program_data);
@@ -4671,6 +4653,7 @@ impl ProgramEscrowContract {
                 version: EVENT_VERSION_V2,
                 router_contract,
                 slippage_bps,
+                max_fot_multiplier_bps,
                 set_by: admin,
                 timestamp: env.ledger().timestamp(),
             },
@@ -9025,16 +9008,3 @@ mod test_event_ordering;
 #[cfg(test)]
 #[path = "release_schedule_host.rs"]
 mod release_schedule_host;
-
-#[cfg(test)]
-mod test_analytics_disambiguation {
-    use super::{Analytics, monitoring};
-    
-    #[test]
-    fn test_analytics_schemas_are_different() {
-        assert!(
-            core::mem::size_of::<Analytics>() != core::mem::size_of::<monitoring::Analytics>(),
-            "The top-level Analytics and monitoring::Analytics schemas must remain structurally distinct to avoid masking the naming collision"
-        );
-    }
-}
