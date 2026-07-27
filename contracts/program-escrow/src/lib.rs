@@ -1318,6 +1318,7 @@ pub enum DataKey {
     PendingClaim(String, u64),       // (program_id, schedule_id) -> ClaimRecord
     ClaimWindow,                     // u64 seconds (global config)
     PauseFlags,                      // PauseFlags struct
+    ProgramPauseFlags(String),       // program_id -> PauseFlags
     RateLimitConfig,                 // RateLimitConfig struct
     MaintenanceMode,                 // bool flag
     ProgramDependencies(String),     // program_id -> Vec<String>
@@ -2982,7 +2983,7 @@ impl ProgramEscrowContract {
         reentrancy_guard::check_not_entered(&env);
         reentrancy_guard::set_entered(&env);
 
-        if Self::check_paused(&env, symbol_short!("lock")) {
+        if Self::check_paused(&env, None, symbol_short!("lock")) {
             reentrancy_guard::clear_entered(&env);
             return Err(BatchError::FundsPaused);
         }
@@ -3018,6 +3019,11 @@ impl ProgramEscrowContract {
         let contract_address = env.current_contract_address();
 
         for item in ordered_items.iter() {
+            if Self::check_paused(&env, Some(&item.program_id), symbol_short!("lock")) {
+                reentrancy_guard::clear_entered(&env);
+                return Err(BatchError::FundsPaused);
+            }
+
             if item.amount <= 0 {
                 reentrancy_guard::clear_entered(&env);
                 return Err(BatchError::InvalidAmount);
@@ -3110,7 +3116,7 @@ impl ProgramEscrowContract {
         reentrancy_guard::check_not_entered(&env);
         reentrancy_guard::set_entered(&env);
 
-        if Self::check_paused(&env, symbol_short!("release")) {
+        if Self::check_paused(&env, None, symbol_short!("release")) {
             reentrancy_guard::clear_entered(&env);
             return Err(BatchError::FundsPaused);
         }
@@ -3129,6 +3135,11 @@ impl ProgramEscrowContract {
         let contract_address = env.current_contract_address();
 
         for item in ordered_items.iter() {
+            if Self::check_paused(&env, Some(&item.program_id), symbol_short!("release")) {
+                reentrancy_guard::clear_entered(&env);
+                return Err(BatchError::FundsPaused);
+            }
+
             let program_key = DataKey::Program(item.program_id.clone());
             let mut program_data: ProgramData =
                 env.storage().instance().get(&program_key).ok_or_else(|| {
@@ -3504,8 +3515,10 @@ impl ProgramEscrowContract {
             panic!("Program not initialized");
         }
 
+        let mut program_data: ProgramData = env.storage().instance().get(&PROGRAM_DATA).unwrap();
+
         // 2. Operational state: paused
-        if Self::check_paused(&env, symbol_short!("lock")) {
+        if Self::check_paused(&env, Some(&program_data.program_id), symbol_short!("lock")) {
             panic!("Funds Paused");
         }
 
@@ -3514,7 +3527,6 @@ impl ProgramEscrowContract {
             panic!("Amount must be greater than zero");
         }
 
-        let mut program_data: ProgramData = env.storage().instance().get(&PROGRAM_DATA).unwrap();
         let contract_address = env.current_contract_address();
         let token_client = token::Client::new(&env, &program_data.token_address);
 
@@ -4776,6 +4788,64 @@ impl ProgramEscrowContract {
         env.storage().instance().set(&DataKey::PauseFlags, &flags);
     }
 
+    pub fn set_program_paused(
+        env: Env,
+        program_id: String,
+        lock: Option<bool>,
+        release: Option<bool>,
+        refund: Option<bool>,
+        reason: Option<String>,
+        unpause_at: Option<u64>,
+    ) {
+        if !env.storage().instance().has(&DataKey::Admin) {
+            panic!("Not initialized");
+        }
+
+        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        admin.require_auth();
+
+        if let Some(ref r) = reason {
+            if r.len() > PAUSE_REASON_MAX_LEN {
+                panic!("Pause reason exceeds maximum length of 256 characters");
+            }
+        }
+
+        let mut flags = Self::get_program_pause_flags(&env, &program_id);
+        let timestamp = env.ledger().timestamp();
+
+        if reason.is_some() {
+            flags.pause_reason = reason.clone();
+        }
+
+        if let Some(paused) = lock {
+            flags.lock_paused = paused;
+            flags.lock_unpause_at = if paused { unpause_at } else { None };
+        }
+
+        if let Some(paused) = release {
+            flags.release_paused = paused;
+            flags.release_unpause_at = if paused { unpause_at } else { None };
+        }
+
+        if let Some(paused) = refund {
+            flags.refund_paused = paused;
+            flags.refund_unpause_at = if paused { unpause_at } else { None };
+        }
+
+        let any_paused = flags.lock_paused || flags.release_paused || flags.refund_paused;
+
+        if any_paused {
+            if flags.paused_at == 0 {
+                flags.paused_at = timestamp;
+            }
+        } else {
+            flags.pause_reason = None;
+            flags.paused_at = 0;
+        }
+
+        env.storage().instance().set(&DataKey::ProgramPauseFlags(program_id), &flags);
+    }
+
     /// Check if the contract is in maintenance mode
     pub fn is_maintenance_mode(env: Env) -> bool {
         env.storage()
@@ -4872,6 +4942,22 @@ impl ProgramEscrowContract {
             })
     }
 
+    pub fn get_program_pause_flags(env: &Env, program_id: &String) -> PauseFlags {
+        env.storage()
+            .instance()
+            .get(&DataKey::ProgramPauseFlags(program_id.clone()))
+            .unwrap_or(PauseFlags {
+                lock_paused: false,
+                release_paused: false,
+                refund_paused: false,
+                pause_reason: None,
+                paused_at: 0,
+                lock_unpause_at: None,
+                release_unpause_at: None,
+                refund_unpause_at: None,
+            })
+    }
+
     /// Returns the stored pause flags schema version.
     ///
     /// Returns `PAUSE_SCHEMA_VERSION_V1` (1) for contracts initialized after
@@ -4901,7 +4987,7 @@ impl ProgramEscrowContract {
     /// exceeds that value, the mode is automatically cleared, storage is updated, and
     /// an `AUTO_UNPAUSE` event is emitted with `actor = "system"`. This is an O(1)
     /// check with no iteration. Repeated calls after clearing do NOT re-emit.
-    fn check_paused(env: &Env, operation: Symbol) -> bool {
+    fn check_paused(env: &Env, program_id: Option<&String>, operation: Symbol) -> bool {
         if Self::is_maintenance_mode(env.clone()) && operation == symbol_short!("lock") {
             return true;
         }
@@ -4989,15 +5075,70 @@ impl ProgramEscrowContract {
             env.storage().instance().set(&DataKey::PauseFlags, &flags);
         }
 
+        let mut global_paused = false;
         if operation == symbol_short!("lock") {
-            flags.lock_paused
+            global_paused = flags.lock_paused;
         } else if operation == symbol_short!("release") {
-            flags.release_paused
+            global_paused = flags.release_paused;
         } else if operation == symbol_short!("refund") {
-            flags.refund_paused
-        } else {
-            false
+            global_paused = flags.refund_paused;
         }
+
+        if global_paused {
+            return true;
+        }
+
+        if let Some(pid) = program_id {
+            let mut program_flags = Self::get_program_pause_flags(env, pid);
+            let mut p_flags_changed = false;
+
+            if program_flags.lock_paused {
+                if let Some(unpause_at) = program_flags.lock_unpause_at {
+                    if current_time > unpause_at {
+                        program_flags.lock_paused = false;
+                        program_flags.lock_unpause_at = None;
+                        p_flags_changed = true;
+                    }
+                }
+            }
+            if program_flags.release_paused {
+                if let Some(unpause_at) = program_flags.release_unpause_at {
+                    if current_time > unpause_at {
+                        program_flags.release_paused = false;
+                        program_flags.release_unpause_at = None;
+                        p_flags_changed = true;
+                    }
+                }
+            }
+            if program_flags.refund_paused {
+                if let Some(unpause_at) = program_flags.refund_unpause_at {
+                    if current_time > unpause_at {
+                        program_flags.refund_paused = false;
+                        program_flags.refund_unpause_at = None;
+                        p_flags_changed = true;
+                    }
+                }
+            }
+
+            if p_flags_changed {
+                let any_paused = program_flags.lock_paused || program_flags.release_paused || program_flags.refund_paused;
+                if !any_paused {
+                    program_flags.pause_reason = None;
+                    program_flags.paused_at = 0;
+                }
+                env.storage().instance().set(&DataKey::ProgramPauseFlags(pid.clone()), &program_flags);
+            }
+
+            if operation == symbol_short!("lock") {
+                return program_flags.lock_paused;
+            } else if operation == symbol_short!("release") {
+                return program_flags.release_paused;
+            } else if operation == symbol_short!("refund") {
+                return program_flags.refund_paused;
+            }
+        }
+
+        false
     }
 
     // --- Circuit Breaker & Rate Limit ---
@@ -6223,7 +6364,7 @@ impl ProgramEscrowContract {
         //    operator's explicit emergency stop is always honoured first,
         //    regardless of automated circuit-breaker state.
         //    See docs/program-escrow/CIRCUIT_BREAKER_ENFORCEMENT.md §Layer Definitions.
-        if Self::check_paused(&env, symbol_short!("release")) {
+        if Self::check_paused(&env, Some(&program_data.program_id), symbol_short!("release")) {
             panic!("Funds Paused");
         }
 
@@ -6562,7 +6703,7 @@ impl ProgramEscrowContract {
         Self::require_active_program(&program_data);
 
         // 3. Operational state: paused
-        if Self::check_paused(&env, symbol_short!("release")) {
+        if Self::check_paused(&env, Some(&program_data.program_id), symbol_short!("release")) {
             panic!("Funds Paused");
         }
 
@@ -7180,7 +7321,7 @@ impl ProgramEscrowContract {
         }
         Self::authorize_release_actor(&env, &program_data, caller.as_ref());
 
-        if Self::check_paused(&env, symbol_short!("release")) {
+        if Self::check_paused(&env, Some(&program_data.program_id), symbol_short!("release")) {
             panic!("Funds Paused");
         }
 
@@ -8201,7 +8342,7 @@ impl ProgramEscrowContract {
         amount: i128,
         claim_deadline: u64,
     ) -> u64 {
-        if Self::check_paused(&env, symbol_short!("release")) {
+        if Self::check_paused(&env, Some(&program_id), symbol_short!("release")) {
             panic!("Funds Paused");
         }
         claim_period::create_pending_claim(&env, &program_id, &recipient, amount, claim_deadline)
@@ -8211,7 +8352,7 @@ impl ProgramEscrowContract {
     ///
     /// Claims are part of the release path, so `release_paused` blocks them.
     pub fn execute_claim(env: Env, program_id: String, claim_id: u64, recipient: Address) {
-        if Self::check_paused(&env, symbol_short!("release")) {
+        if Self::check_paused(&env, Some(&program_id), symbol_short!("release")) {
             panic!("Funds Paused");
         }
         claim_period::execute_claim(&env, &program_id, claim_id, &recipient)
@@ -8222,7 +8363,7 @@ impl ProgramEscrowContract {
     /// Claim cancellation is a refund-path operation, so `refund_paused`
     /// blocks it independently of lock and release operations.
     pub fn cancel_claim(env: Env, program_id: String, claim_id: u64, admin: Address) {
-        if Self::check_paused(&env, symbol_short!("refund")) {
+        if Self::check_paused(&env, Some(&program_id), symbol_short!("refund")) {
             panic!("Funds Paused");
         }
         claim_period::cancel_claim(&env, &program_id, claim_id, &admin)

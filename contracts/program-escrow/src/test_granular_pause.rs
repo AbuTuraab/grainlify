@@ -1,4 +1,4 @@
-﻿#![cfg(test)]
+#![cfg(test)]
 
 //! Exhaustive matrix tests for the three granular pause flags.
 //!
@@ -521,3 +521,55 @@ fn test_unpausing_release_does_not_unpause_lock_or_refund() {
     );
 }
 
+/// Verify the layered precedence between global and per-program pause flags.
+/// An operation is blocked if EITHER the global flag OR the per-program flag is set.
+#[test]
+fn test_layered_pause_precedence() {
+    let cases = [
+        (false, false, true),
+        (true, false, false),
+        (false, true, false),
+        (true, true, false),
+    ];
+    
+    // Test lock path (lock_program_funds)
+    for (global, program, allowed) in cases.iter() {
+        let env = Env::default();
+        let ctx = setup_program(&env, 0);
+        mint_to_contract(&env, &ctx.client, &ctx.token, LOCK_AMOUNT);
+        
+        ctx.client.set_paused(&Some(*global), &Some(false), &Some(false), &None::<String>, &None::<u64>);
+        ctx.client.set_program_paused(&ctx.program_id, &Some(*program), &Some(false), &Some(false), &None::<String>, &None::<u64>);
+        
+        let res = ctx.client.try_lock_program_funds(&LOCK_AMOUNT).is_ok();
+        assert_eq!(res, *allowed, "lock: global={}, program={}", global, program);
+    }
+
+    // Test release path (single_payout)
+    for (global, program, allowed) in cases.iter() {
+        let env = Env::default();
+        let ctx = setup_program(&env, INITIAL_LOCKED_BALANCE);
+        let recipient = Address::generate(&env);
+        
+        ctx.client.set_paused(&Some(false), &Some(*global), &Some(false), &None::<String>, &None::<u64>);
+        ctx.client.set_program_paused(&ctx.program_id, &Some(false), &Some(*program), &Some(false), &None::<String>, &None::<u64>);
+        
+        let res = ctx.client.try_single_payout(&recipient, &RELEASE_AMOUNT, &None).is_ok();
+        assert_eq!(res, *allowed, "release: global={}, program={}", global, program);
+    }
+    
+    // Test refund path (cancel_claim)
+    for (global, program, allowed) in cases.iter() {
+        let env = Env::default();
+        let ctx = setup_program(&env, INITIAL_LOCKED_BALANCE);
+        let recipient = Address::generate(&env);
+        env.ledger().set_timestamp(TEST_TIMESTAMP);
+        let claim_id = ctx.client.create_pending_claim(&ctx.program_id, &recipient, &RELEASE_AMOUNT, &CLAIM_DEADLINE);
+        
+        ctx.client.set_paused(&Some(false), &Some(false), &Some(*global), &None::<String>, &None::<u64>);
+        ctx.client.set_program_paused(&ctx.program_id, &Some(false), &Some(false), &Some(*program), &None::<String>, &None::<u64>);
+        
+        let res = ctx.client.try_cancel_claim(&ctx.program_id, &claim_id, &ctx.admin).is_ok();
+        assert_eq!(res, *allowed, "refund: global={}, program={}", global, program);
+    }
+}
