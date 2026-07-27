@@ -679,7 +679,7 @@ pub enum ContractError {
     ///
     /// This error occurs when role rotation is temporarily disabled
     /// due to contract state (e.g., emergency mode, dispute, etc.).
-    RoleRotationNotAllowed = 1208,
+    RotationTimelockActive = 1209,
 
     // =========================================================================
     // Dynamic Pricing Errors (1300-1399)

@@ -688,7 +688,7 @@ pub enum ProgramStatus {
 /// # Example
 /// ```rust,ignore
 /// // Set custom threshold for a large program
-/// contract.set_program_circuit_breaker_threshold(&program_id, &Some(10u8));
+/// contract.set_program_circuit_breaker_threshold(&program_id, &Some(10u32));
 ///
 /// // Reset to global default
 /// contract.set_program_circuit_breaker_threshold(&program_id, &None);
@@ -709,11 +709,10 @@ pub struct ProgramData {
     pub risk_flags: u32,
     pub archived: bool,
     pub archived_at: Option<u64>,
-    pub status: ProgramStatus,
     /// Optional per-program circuit breaker failure threshold.
     /// If set, overrides the global default (3) for this program.
     /// Must be between 1 and 100 inclusive when set.
-    pub circuit_breaker_threshold: Option<u8>,
+    pub circuit_breaker_threshold: Option<u32>,
 }
 
 // ========================================================================
@@ -868,9 +867,9 @@ pub struct CircuitBreakerThresholdSetEvent {
     /// Program the threshold applies to.
     pub program_id: String,
     /// Previous threshold value (None = not set, uses global default of 3).
-    pub previous_threshold: Option<u8>,
+    pub previous_threshold: Option<u32>,
     /// New threshold value (None = reset to global default of 3).
-    pub new_threshold: Option<u8>,
+    pub new_threshold: Option<u32>,
     /// Admin that made the change.
     pub set_by: Address,
     /// Ledger timestamp.
@@ -3909,6 +3908,12 @@ impl ProgramEscrowContract {
     }
 
     /// Set a delegate for a program with specific permissions.
+    ///
+    /// ### Controller Rotation Interaction
+    /// Reassigning a delegate while a `propose_controller` rotation is pending
+    /// is explicitly permitted. This operation does **not** invalidate the pending
+    /// rotation. Any delegate set here will carry over and remain active even
+    /// after the new controller accepts the role.
     pub fn set_program_delegate(
         env: Env,
         program_id: String,
@@ -4048,6 +4053,12 @@ impl ProgramEscrowContract {
 
     /// Propose a new controller (authorized_payout_key) for a program (step 1).
     /// Current controller or admin must authorize. Returns explicit errors for deterministic behavior.
+    ///
+    /// ### Delegate Interaction
+    /// Proposing a controller does not affect existing delegates. Furthermore,
+    /// the outgoing controller retains full authority (including the ability
+    /// to reassign the delegate via `set_program_delegate`) until the rotation
+    /// is accepted.
     pub fn propose_controller(
         env: Env,
         program_id: String,
@@ -4113,6 +4124,12 @@ impl ProgramEscrowContract {
 
     /// Accept the proposed controller role for a program (step 2).
     /// The proposed controller must authorize. Returns explicit errors for deterministic behavior.
+    ///
+    /// ### Delegate Carryover
+    /// When a rotation is accepted, the previously-assigned delegate and their
+    /// permissions **carry over** and remain active. The incoming controller
+    /// inherits the existing delegate and is responsible for reviewing and
+    /// revoking them if their authority is no longer desired.
     ///
     /// ### Timelock
     /// A mandatory 24-hour delay (`ROTATION_TIMELOCK_DELAY`) must elapse between
@@ -5173,7 +5190,7 @@ impl ProgramEscrowContract {
     pub fn set_program_circuit_breaker_threshold(
         env: Env,
         program_id: String,
-        threshold: Option<u8>,
+        threshold: Option<u32>,
     ) {
         let program_data = Self::get_program_data_by_id(&env, &program_id);
         program_data.authorized_payout_key.require_auth();
