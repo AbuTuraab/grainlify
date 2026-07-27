@@ -150,6 +150,8 @@ mod errors;
 pub use errors::BatchPayoutError;
 use errors::ContractError;
 
+mod gas_optimization;
+
 mod metadata;
 pub use metadata::{
     CompressedCustomField, CompressedProgramMetadata, MetadataFieldKey,
@@ -2748,11 +2750,14 @@ impl ProgramEscrowContract {
         if batch_size == 0 || batch_size > MAX_BATCH_SIZE {
             return Err(BatchError::InvalidBatchSizeProgram);
         }
-        for i in 0..batch_size {
-            for j in (i + 1)..batch_size {
-                if items.get(i).unwrap().program_id == items.get(j).unwrap().program_id {
-                    return Err(BatchError::DuplicateProgramId);
-                }
+        {
+            let mut program_ids: soroban_sdk::Vec<String> = soroban_sdk::Vec::new(&env);
+            for i in 0..batch_size {
+                program_ids.push_back(items.get(i).unwrap().program_id.clone());
+            }
+            let deduped = gas_optimization::deduplicate_program_ids(&env, &program_ids);
+            if deduped.len() < program_ids.len() {
+                return Err(BatchError::DuplicateProgramId);
             }
         }
         for i in 0..batch_size {
