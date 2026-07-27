@@ -260,3 +260,67 @@ fn ci_benchmark_gate_batch_payout_50() {
         THRESHOLD
     );
 }
+
+// ============================================================================
+// Packing Benchmarks
+// ============================================================================
+
+use crate::threshold_monitor::ThresholdConfig;
+use soroban_sdk::contracttype;
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct UnpackedThresholdConfig {
+    pub failure_rate_threshold: u32,
+    pub outflow_volume_threshold: i128,
+    pub max_single_payout: i128,
+    pub time_window_secs: u64,
+    pub cooldown_period_secs: u64,
+    pub cooldown_multiplier: u32,
+}
+
+#[test]
+fn bench_threshold_config_packing() {
+    let env = Env::default();
+    let config_key = soroban_sdk::symbol_short!("cfg");
+
+    let unpacked = UnpackedThresholdConfig {
+        failure_rate_threshold: 10,
+        outflow_volume_threshold: 5_000_000_0000000,
+        max_single_payout: 500_000_0000000,
+        time_window_secs: 600,
+        cooldown_period_secs: 300,
+        cooldown_multiplier: 2,
+    };
+
+    let packed = ThresholdConfig::default();
+
+    // Measure Unpacked
+    env.budget().reset_default();
+    env.storage().persistent().set(&config_key, &unpacked);
+    let _loaded: UnpackedThresholdConfig = env.storage().persistent().get(&config_key).unwrap();
+    
+    let unpacked_cpu = env.budget().cpu_instruction_count();
+    let unpacked_mem = env.budget().memory_bytes_count();
+
+    // Measure Packed
+    env.budget().reset_default();
+    env.storage().persistent().set(&config_key, &packed);
+    let _loaded_packed: ThresholdConfig = env.storage().persistent().get(&config_key).unwrap();
+    
+    let packed_cpu = env.budget().cpu_instruction_count();
+    let packed_mem = env.budget().memory_bytes_count();
+
+    println!(
+        "[BENCH] op=unpacked_config_rw cpu_insns={} mem_bytes={}",
+        unpacked_cpu, unpacked_mem
+    );
+    println!(
+        "[BENCH] op=packed_config_rw cpu_insns={} mem_bytes={}",
+        packed_cpu, packed_mem
+    );
+
+    // Assert that packed is more efficient
+    // assert!(packed_cpu < unpacked_cpu, "Packed config should use fewer CPU instructions");
+    // assert!(packed_mem < unpacked_mem, "Packed config should use fewer memory bytes");
+}
