@@ -383,6 +383,13 @@ mod monitoring {
     }
 
     // Data: Analytics
+    /// Internal monitoring analytics.
+    ///
+    /// **WARNING: Naming Collision**
+    /// This `Analytics` struct tracks operational metrics (`operation_count`, `unique_users`, etc.)
+    /// and is completely incompatible with the top-level `Analytics` struct (which tracks
+    /// financial totals like `total_locked`). 
+    /// SDK authors and indexers must not conflate the two.
     #[contracttype]
     #[derive(Clone, Debug)]
     pub struct Analytics {
@@ -745,6 +752,12 @@ pub struct FotRouter {
     pub router_contract: Address,
     /// Slippage tolerance in basis points (0 – 500, i.e. 0 – 5 %).
     pub slippage_bps: u32,
+    /// Maximum gross-to-net multiplier for router quotes, in basis points over 10_000.
+    ///
+    /// For example, `15_000` permits a gross quote up to 1.5x the intended net.
+    /// This bound prevents a compromised or misconfigured router from draining
+    /// the program with an implausibly inflated quote.
+    pub max_fot_multiplier_bps: u32,
 }
 
 /// Nullable wrapper for `FotRouter` stored inside `ProgramData`.
@@ -766,6 +779,8 @@ pub struct FotRouterSetEvent {
     pub version: u32,
     pub router_contract: Address,
     pub slippage_bps: u32,
+    /// Configured upper-bound multiplier for gross router quotes, in basis points over 10_000.
+    pub max_fot_multiplier_bps: u32,
     pub set_by: Address,
     pub timestamp: u64,
 }
@@ -777,47 +792,6 @@ pub struct FotRouterClearedEvent {
     pub version: u32,
     pub set_by: Address,
     pub timestamp: u64,
-}
-
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct FotRouter {
-    /// Address of the router contract that implements `quote(Address, i128) -> i128`.
-    pub router_contract: Address,
-    /// Slippage tolerance in basis points (1 bp = 0.01%).
-    /// Applied as a buffer on top of the quoted amount.
-    pub slippage_bps: u32,
-}
-
-/// Event emitted when the FoT router configuration is set or updated.
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct FotRouterSetEvent {
-    pub version: u32,
-    pub router_contract: Address,
-    pub slippage_bps: u32,
-    pub set_by: Address,
-    pub timestamp: u64,
-}
-
-/// Event emitted when the FoT router configuration is cleared.
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct FotRouterClearedEvent {
-    pub version: u32,
-    pub set_by: Address,
-    pub timestamp: u64,
-}
-
-/// Contract-type-safe optional wrapper around [`FotRouter`].
-///
-/// Nested `Option<FotRouter>` inside another `#[contracttype]` breaks under
-/// Cargo feature unification with `soroban-sdk/testutils` (unit-test builds).
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum OptionalFotRouter {
-    None,
-    Some(FotRouter),
 }
 
 #[contracttype]
@@ -836,11 +810,6 @@ pub struct ProgramData {
     pub reference_hash: Option<soroban_sdk::Bytes>,
     pub archived: bool,
     pub archived_at: Option<u64>,
-    // --- Program identity and history ---
-    pub program_id: String,
-    pub payout_history: soroban_sdk::Vec<PayoutRecord>,
-    pub initial_liquidity: i128,
-    pub reference_hash: Option<soroban_sdk::Bytes>,
     /// Optional per-program circuit breaker failure threshold.
     /// If set, overrides the global default (3) for this program.
     /// Must be between 1 and 100 inclusive when set.
@@ -1437,6 +1406,8 @@ pub enum DataKey {
     /// enabling dwell-time queries for ecosystem operators.
     /// Written on each status change; read via get_program_lifecycle_timeline.
     LifecycleTimeline(String),
+    /// Lightweight hotness signal tracker: program_id -> access count
+    ProgramAccessSignal(String),
 
     /// Accumulated insurance-reserve balance in native token units.
     ///
@@ -1501,14 +1472,6 @@ const ANONYMOUS_RESOLVER_SET: Symbol = symbol_short!("AnonRslvS");
 const ANONYMOUS_RESOLVER_REMOVED: Symbol = symbol_short!("AnonRslvR");
 
 /// Delegate info for a single program, returned by `query_program_delegates`.
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ProgramDelegateInfo {
-    pub program_id: String,
-    pub delegate: Option<Address>,
-    pub permissions: u32,
-}
-
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PauseFlags {
@@ -1636,6 +1599,14 @@ pub struct HistoryPaginationConfig {
 /// detect schema mismatches on legacy deployments.
 pub const PAGINATION_SCHEMA_VERSION_V1: u32 = 1;
 
+/// Top-level analytics for the program escrow.
+/// 
+/// **WARNING: Naming Collision**
+/// This `Analytics` struct tracks financial metrics (`total_locked`, `total_released`, etc.) 
+/// and is completely incompatible with the `Analytics` struct defined in the internal 
+/// `monitoring` module (which tracks `operation_count`, `unique_users`, etc.). 
+/// SDK authors and indexers must not conflate the two.
+/// (Consider using an alias like `EscrowAnalytics` in off-chain code to avoid confusion).
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Analytics {
@@ -2114,7 +2085,11 @@ mod reentrancy_tests;
 mod test_circuit_breaker_enforcement;
 // #[cfg(test)] mod test_dispute_resolution; // pre-existing breakage
 mod fot_routing;
+#[cfg(test)]
+mod test_fot_routing;
 mod threshold_monitor;
+#[cfg(test)]
+mod threshold_monitor_prop_tests;
 mod token_math;
 mod reputation;
 pub use reputation::{
@@ -2178,6 +2153,10 @@ const READ_ONLY_MODE_CHANGED: Symbol = symbol_short!("ROModeChg");
 
 #[contract]
 pub struct ProgramEscrowContract;
+
+const TTL_MIN_LEDGERS: u32 = 518_400; // ~30 days
+const TTL_MAX_LEDGERS: u32 = 3_110_400; // ~180 days
+const TTL_MAX_ACCESS_COUNT: u32 = 100;
 
 #[contractimpl]
 impl ProgramEscrowContract {
@@ -4134,6 +4113,7 @@ impl ProgramEscrowContract {
     fn store_program_data(env: &Env, program_id: &String, program_data: &ProgramData) {
         let program_key = DataKey::Program(program_id.clone());
         env.storage().instance().set(&program_key, program_data);
+        Self::track_and_extend_program_ttl(env, program_id, None);
 
         if env.storage().instance().has(&PROGRAM_DATA) {
             let existing: ProgramData = env
@@ -4145,6 +4125,34 @@ impl ProgramEscrowContract {
                 env.storage().instance().set(&PROGRAM_DATA, program_data);
             }
         }
+    }
+
+    /// Tracks program access frequency and adapts TTL dynamically based on hotness.
+    fn track_and_extend_program_ttl(env: &Env, program_id: &String, persistent_key: Option<&DataKey>) {
+        let signal_key = DataKey::ProgramAccessSignal(program_id.clone());
+        let mut access_count: u32 = env
+            .storage()
+            .persistent()
+            .get(&signal_key)
+            .unwrap_or(0);
+
+        if access_count < TTL_MAX_ACCESS_COUNT {
+            access_count += 1;
+            env.storage().persistent().set(&signal_key, &access_count);
+        }
+
+        let extra_ttl = (TTL_MAX_LEDGERS - TTL_MIN_LEDGERS)
+            .saturating_mul(access_count)
+            / TTL_MAX_ACCESS_COUNT;
+        
+        let ttl_to_set = TTL_MIN_LEDGERS + extra_ttl;
+        
+        env.storage().instance().extend_ttl(TTL_MIN_LEDGERS, ttl_to_set);
+
+        if let Some(key) = persistent_key {
+            env.storage().persistent().extend_ttl(key, TTL_MIN_LEDGERS, ttl_to_set);
+        }
+        env.storage().persistent().extend_ttl(&signal_key, TTL_MIN_LEDGERS, ttl_to_set);
     }
 
     fn require_program_owner_or_admin(
@@ -4626,15 +4634,30 @@ impl ProgramEscrowContract {
     /// # Arguments
     /// * `router_contract` - Address of the AMM router contract implementing `quote`.
     /// * `slippage_bps` - Slippage tolerance in basis points (0-500, i.e. 0-5%).
+    /// * `max_fot_multiplier_bps` - Upper-bound multiplier for router quotes,
+    ///   expressed in basis points over 10_000 (e.g. `15_000` = 1.5x the net amount).
+    ///   This sanity cap prevents a malicious or misconfigured router from draining
+    ///   the program with an implausibly inflated `quote`.
     ///
     /// # Panics
     /// * If the contract is not initialized
     /// * If caller is not the admin
     /// * If `slippage_bps` exceeds 500 (5%)
-    pub fn set_fot_router(env: Env, router_contract: Address, slippage_bps: u32) {
+    /// * If `max_fot_multiplier_bps` is outside the allowed range
+    pub fn set_fot_router(
+        env: Env,
+        router_contract: Address,
+        slippage_bps: u32,
+        max_fot_multiplier_bps: u32,
+    ) {
         let admin = Self::require_admin(&env);
         if slippage_bps > 500 {
             panic!("FoT router slippage exceeds maximum (500 bps = 5%)");
+        }
+        if max_fot_multiplier_bps < crate::BASIS_POINTS as u32
+            || max_fot_multiplier_bps > crate::fot_routing::MAX_FOT_MULTIPLIER_BPS
+        {
+            panic!("FoT router max multiplier must be between 10000 and 100000 basis points");
         }
 
         let mut program_data: ProgramData = env
@@ -4646,6 +4669,7 @@ impl ProgramEscrowContract {
         program_data.fot_router = OptionalFotRouter::Some(FotRouter {
             router_contract: router_contract.clone(),
             slippage_bps,
+            max_fot_multiplier_bps,
         });
 
         env.storage().instance().set(&PROGRAM_DATA, &program_data);
@@ -4656,6 +4680,7 @@ impl ProgramEscrowContract {
                 version: EVENT_VERSION_V2,
                 router_contract,
                 slippage_bps,
+                max_fot_multiplier_bps,
                 set_by: admin,
                 timestamp: env.ledger().timestamp(),
             },
@@ -7117,8 +7142,13 @@ impl ProgramEscrowContract {
 
     /// Get program information
     ///
+    /// # Deprecation Note
+    /// This is the legacy singleton accessor. Use `get_program_info_v2` which
+    /// reads from `DataKey::Program(id)` instead.
+    ///
     /// # Returns
     /// ProgramData containing all program information
+    #[deprecated(note = "Use get_program_info_v2 instead")]
     pub fn get_program_info(env: Env) -> ProgramData {
         env.storage()
             .instance()
@@ -7992,6 +8022,7 @@ impl ProgramEscrowContract {
             .unwrap_or_else(|| soroban_sdk::Vec::new(env));
         index.push_back(record.clone());
         env.storage().persistent().set(&key, &index);
+        Self::track_and_extend_program_ttl(env, program_id, Some(&key));
     }
 
     /// Query idempotency key status
@@ -9010,4 +9041,3 @@ mod test_event_ordering;
 #[cfg(test)]
 #[path = "release_schedule_host.rs"]
 mod release_schedule_host;
-

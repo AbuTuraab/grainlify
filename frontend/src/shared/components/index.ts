@@ -2,6 +2,8 @@
 export { LanguageIcon } from "./LanguageIcon";
 export { UserProfileDropdown } from "./UserProfileDropdown";
 export { FilterDropdown } from "./FilterDropdown";
+export { FilterChip } from "./FilterChip";
+export { ActiveFilterChips } from "./ActiveFilterChips";
 export { GlassDropdown } from "./GlassDropdown";
 export { NotificationsDropdown } from "./NotificationsDropdown";
 export { EmptyState } from "./EmptyState";
