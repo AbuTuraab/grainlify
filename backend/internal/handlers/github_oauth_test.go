@@ -188,3 +188,39 @@ func TestEncodeAndDecodeStateWithRedirect(t *testing.T) {
 		}
 	})
 }
+
+func TestDeterminismAcrossRetries(t *testing.T) {
+	cfg := config.Config{
+		CORSOrigins: "https://app.grainlify.com",
+	}
+	csrfToken := "deterministic_csrf_token_001"
+	redirectURI := "https://app.grainlify.com/callback"
+
+	initialEncoded := encodeStateWithRedirect(csrfToken, redirectURI)
+	initialToken, initialRedirect, initialErr := decodeStateWithRedirect(initialEncoded)
+	initialAllowed := isAllowedRedirectURI(redirectURI, cfg)
+
+	if initialErr != nil {
+		t.Fatalf("unexpected error in initial decode: %v", initialErr)
+	}
+
+	for i := 0; i < 100; i++ {
+		encoded := encodeStateWithRedirect(csrfToken, redirectURI)
+		if encoded != initialEncoded {
+			t.Fatalf("retry %d: encoded state mismatch: got %q; want %q", i, encoded, initialEncoded)
+		}
+
+		tok, red, err := decodeStateWithRedirect(encoded)
+		if err != nil {
+			t.Fatalf("retry %d: unexpected error decoding: %v", i, err)
+		}
+		if tok != initialToken || red != initialRedirect {
+			t.Fatalf("retry %d: decoded output mismatch: got (%q, %q); want (%q, %q)", i, tok, red, initialToken, initialRedirect)
+		}
+
+		allowed := isAllowedRedirectURI(redirectURI, cfg)
+		if allowed != initialAllowed {
+			t.Fatalf("retry %d: isAllowedRedirectURI mismatch: got %v; want %v", i, allowed, initialAllowed)
+		}
+	}
+}

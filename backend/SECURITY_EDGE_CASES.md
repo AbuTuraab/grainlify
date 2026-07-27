@@ -71,6 +71,9 @@ To ensure future changes do not introduce security regressions or break existing
 4. **Response Contract Invariant:**
    - Error responses for authentication failures MUST preserve exact JSON error keys (`missing_bearer_token`, `invalid_token`, `invalid_or_expired_state`, `redirect_uri_not_allowed`).
 
+5. **Determinism & Retry Stability Invariant:**
+   - State parameter encoding, decoding, and origin validation helper functions MUST be pure and strictly deterministic across retries, re-renders, and concurrent evaluations. Calling `encodeStateWithRedirect`, `decodeStateWithRedirect`, or `isAllowedRedirectURI` 100 times sequentially with identical input parameters MUST produce identical output results without state leakage or side effects.
+
 ---
 
 ## 4. Test Coverage Reference

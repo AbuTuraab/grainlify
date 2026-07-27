@@ -79,4 +79,24 @@ describe('CSRF and Browser Security Edge Cases', () => {
       expect(validateCSRFToken('token_1', 'token_1', past)).toBe(false);
     });
   });
+
+  describe('Determinism and Retry Stability', () => {
+    it('is strictly deterministic across 100 repeated retries', () => {
+      const token = 'repeat_test_token_999';
+      const redirect = 'https://my-app.vercel.app/callback';
+      const initialEncoded = encodeStateWithRedirect(token, redirect);
+      const initialDecoded = decodeStateWithRedirect(initialEncoded);
+      const initialAllowed = isAllowedRedirectURI(redirect);
+
+      for (let i = 0; i < 100; i++) {
+        const encoded = encodeStateWithRedirect(token, redirect);
+        const decoded = decodeStateWithRedirect(encoded);
+        const allowed = isAllowedRedirectURI(redirect);
+
+        expect(encoded).toBe(initialEncoded);
+        expect(decoded).toEqual(initialDecoded);
+        expect(allowed).toBe(initialAllowed);
+      }
+    });
+  });
 });
