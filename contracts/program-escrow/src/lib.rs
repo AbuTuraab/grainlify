@@ -781,47 +781,6 @@ pub struct FotRouterClearedEvent {
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct FotRouter {
-    /// Address of the router contract that implements `quote(Address, i128) -> i128`.
-    pub router_contract: Address,
-    /// Slippage tolerance in basis points (1 bp = 0.01%).
-    /// Applied as a buffer on top of the quoted amount.
-    pub slippage_bps: u32,
-}
-
-/// Event emitted when the FoT router configuration is set or updated.
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct FotRouterSetEvent {
-    pub version: u32,
-    pub router_contract: Address,
-    pub slippage_bps: u32,
-    pub set_by: Address,
-    pub timestamp: u64,
-}
-
-/// Event emitted when the FoT router configuration is cleared.
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct FotRouterClearedEvent {
-    pub version: u32,
-    pub set_by: Address,
-    pub timestamp: u64,
-}
-
-/// Contract-type-safe optional wrapper around [`FotRouter`].
-///
-/// Nested `Option<FotRouter>` inside another `#[contracttype]` breaks under
-/// Cargo feature unification with `soroban-sdk/testutils` (unit-test builds).
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum OptionalFotRouter {
-    None,
-    Some(FotRouter),
-}
-
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ProgramData {
     pub program_id: String,
     pub total_funds: i128,
@@ -836,11 +795,6 @@ pub struct ProgramData {
     pub reference_hash: Option<soroban_sdk::Bytes>,
     pub archived: bool,
     pub archived_at: Option<u64>,
-    // --- Program identity and history ---
-    pub program_id: String,
-    pub payout_history: soroban_sdk::Vec<PayoutRecord>,
-    pub initial_liquidity: i128,
-    pub reference_hash: Option<soroban_sdk::Bytes>,
     /// Optional per-program circuit breaker failure threshold.
     /// If set, overrides the global default (3) for this program.
     /// Must be between 1 and 100 inclusive when set.
@@ -1501,14 +1455,6 @@ const ANONYMOUS_RESOLVER_SET: Symbol = symbol_short!("AnonRslvS");
 const ANONYMOUS_RESOLVER_REMOVED: Symbol = symbol_short!("AnonRslvR");
 
 /// Delegate info for a single program, returned by `query_program_delegates`.
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ProgramDelegateInfo {
-    pub program_id: String,
-    pub delegate: Option<Address>,
-    pub permissions: u32,
-}
-
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PauseFlags {
