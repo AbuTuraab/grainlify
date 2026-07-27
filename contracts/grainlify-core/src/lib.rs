@@ -2208,22 +2208,27 @@ impl GrainlifyContract {
     ///
     /// * **Replay Protection**: The commitment is consumed (deleted) after successful
     ///   migration, preventing replay of the same migration hash.
-    /// * **Expiry Defense-in-Depth**: If a commitment expires, it is consumed even on
-    ///   failure to prevent replay after ledger timestamp resets (e.g., Stellar testnet
-    ///   resets). This is critical because `env.ledger().timestamp()` may move backward
-    ///   in test environments.
+    /// * **Expiry**: On networks with monotonic timestamps (Stellar mainnet), an expired
+    ///   commitment cannot become valid again because time never moves backward. On test
+    ///   networks with periodic timestamp resets, an expired commitment that survives a
+    ///   failed migration (because Soroban rolls back all state on panic) can become
+    ///   valid again after a reset. Admins must treat expiry failures as requiring a
+    ///   fresh `commit_migration`.
     /// * **Hash Binding**: The hash check is independent of timestamp checks, providing
-    ///   a second barrier against replay attacks even if timestamp-based protections fail.
+    ///   a standalone barrier against replay of an unintended migration payload.
     /// * **Version Isolation**: Commitments are keyed by `target_version`, preventing
     ///   cross-version replay (a hash committed for v3 cannot be used for v4).
     ///
     /// # Trust Assumptions
     ///
-    /// * **Ledger Timestamp Monotonicity**: The expiry mechanism assumes the ledger
-    ///   timestamp generally moves forward. In production (Stellar mainnet), this holds.
-    ///   In test networks with periodic resets, the expiry check alone is insufficient.
-    ///   The defense-in-depth mechanism (consuming expired commitments) and hash
-    ///   verification provide protection against timestamp reset scenarios.
+    /// * **Soroban Atomicity**: All storage writes in a contract execution are rolled
+    ///   back if the contract panics. This means the expiry check cannot consume a
+    ///   commitment on failure.
+    /// * **Ledger Timestamp Monotonicity**: The expiry mechanism is reliable only on
+    ///   networks where the ledger timestamp never moves backward (Stellar mainnet).
+    ///   On test networks with periodic resets, admins must re-commit after expiry
+    ///   failures. The migration hash provides the primary replay defense independent
+    ///   of timestamp monotonicity.
     ///
     /// # Errors
     ///
@@ -2295,21 +2300,24 @@ impl GrainlifyContract {
     ///   replay attacks.
     /// * **Commitment Consumption**: After successful migration, the commitment is deleted
     ///   from storage, preventing replay of the same migration.
-    /// * **Expiry Defense-in-Depth**: If a commitment has expired (current timestamp > expires_at),
-    ///   the commitment is consumed even on failure. This prevents replay after ledger
-    ///   timestamp resets (e.g., Stellar testnet resets).
-    /// * **Hash Independence**: The hash check is independent of timestamp checks, providing
-    ///   a second barrier against replay attacks even if timestamp-based protections fail.
+    /// * **Expiry**: If a commitment has expired (current timestamp > expires_at),
+    ///   the contract rejects the migration. Because Soroban rolls back all state on
+    ///   panic, the commitment is not consumed on failure. On networks with monotonic
+    ///   timestamps (Stellar mainnet) this is not exploitable. On test networks that
+    ///   reset timestamps, admins must re-commit after any expiry failure.
+    /// * **Hash Independence**: The hash check is independent of timestamp checks,
+    ///   providing a standalone barrier against replay of an unintended payload.
     /// * **Version Monotonicity**: Only forward migrations are allowed (target_version > current_version).
     ///   Downgrades are rejected to prevent state corruption.
     ///
     /// # Trust Assumptions
     ///
-    /// * **Ledger Timestamp Monotonicity**: The expiry mechanism checks `env.ledger().timestamp()`
-    ///   against the commitment's `expires_at`. In production (Stellar mainnet), the ledger
-    ///   timestamp is monotonic. In test networks with periodic resets, the timestamp may
-    ///   move backward. The defense-in-depth mechanism (consuming expired commitments) and
-    ///   hash verification protect against this scenario.
+    /// * **Soroban Atomicity**: Because all storage writes are rolled back on panic,
+    ///   `migrate()` cannot persist the removal of an expired commitment.
+    /// * **Ledger Timestamp Monotonicity**: The expiry check is reliable only on networks
+    ///   where the ledger timestamp never moves backward. Test network resets can make
+    ///   a previously-expired commitment valid again. The migration hash binding and
+    ///   idempotency guard are the primary replay defenses independent of time.
     ///
     /// # Errors
     ///
@@ -2327,14 +2335,12 @@ impl GrainlifyContract {
         admin.require_auth();
         Self::require_not_read_only(&env);
 
-        // Idempotency: skip if already migrated to this version
         if let Some(state) = env.storage().instance().get::<_, MigrationState>(&DataKey::MigrationState) {
             if state.to_version == target_version {
                 return;
             }
         }
 
-        // [FIX-C01] Verify commitment exists and hash matches
         let commitment: MigrationCommitment = env.storage().instance()
             .get(&DataKey::MigrationCommitment(target_version))
             .unwrap_or_else(|| panic!("{}", ContractError::MigrationCommitmentNotFound as u32));
@@ -2350,13 +2356,10 @@ impl GrainlifyContract {
         }
 
         if commitment.expires_at > 0 && env.ledger().timestamp() > commitment.expires_at {
-            // Consume commitment even on expiry failure to prevent replay
-            // after a ledger-timestamp reset.
             env.storage().instance().remove(&DataKey::MigrationCommitment(target_version));
             panic!("Migration commitment has expired");
         }
 
-        // Run version-specific migration logic
         if current_version == 1 && target_version == 2 {
             migrate_v1_to_v2(&env);
         } else if current_version == 2 && target_version == 3 {
@@ -2377,7 +2380,6 @@ impl GrainlifyContract {
         env.storage().instance().set(&DataKey::MigrationState, &state);
         env.storage().instance().set(&DataKey::Version, &target_version);
 
-        // Consume commitment (replay protection)
         env.storage().instance().remove(&DataKey::MigrationCommitment(target_version));
 
         env.events().publish(
