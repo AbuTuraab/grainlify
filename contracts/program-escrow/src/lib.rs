@@ -672,6 +672,65 @@ pub enum ProgramStatus {
     Active,
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// FEE-ON-TRANSFER ROUTER TYPES
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Configuration for an AMM router that handles fee-on-transfer token routing.
+///
+/// When configured the contract calls `router.quote(token, net)` before each
+/// payout transfer to compute the gross amount required to deliver `net` to
+/// the recipient after the token's FoT deduction.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FotRouter {
+    /// Address of the AMM router contract implementing `quote(Address, i128) -> i128`.
+    pub router_contract: Address,
+    /// Slippage tolerance in basis points (0–500 → 0–5%).
+    pub slippage_bps: u32,
+}
+
+/// Optional wrapper for [`FotRouter`] stored inside [`ProgramData`].
+///
+/// A `#[contracttype]` enum is used instead of `Option<FotRouter>` because
+/// Soroban's XDR codec requires all enum/union variants to be `#[contracttype]`
+/// annotated for deterministic on-chain serialisation.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum OptionalFotRouter {
+    /// No FoT router configured; payouts use the requested amount directly.
+    None,
+    /// A router is configured; payouts route through it to cover FoT fees.
+    Some(FotRouter),
+}
+
+/// Emitted when a FoT router is configured via `set_fot_router`.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FotRouterSetEvent {
+    pub version: u32,
+    pub router_contract: Address,
+    pub slippage_bps: u32,
+    pub set_by: Address,
+    pub timestamp: u64,
+}
+
+/// Emitted when a FoT router configuration is cleared via `clear_fot_router`.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FotRouterClearedEvent {
+    pub version: u32,
+    pub set_by: Address,
+    pub timestamp: u64,
+}
+
+/// Event symbol for `FotRouterSetEvent`.
+const FOT_ROUTER_SET: Symbol = symbol_short!("FotRtrS");
+/// Event symbol for `FotRouterClearedEvent`.
+const FOT_ROUTER_CLEARED: Symbol = symbol_short!("FotRtrC");
+
+// ─────────────────────────────────────────────────────────────────────────────
+
 /// Per-program circuit breaker threshold configuration.
 ///
 /// The circuit breaker protects against cascading failures by opening after
@@ -694,13 +753,28 @@ pub enum ProgramStatus {
 /// contract.set_program_circuit_breaker_threshold(&program_id, &None);
 /// ```
 
+/// Core program state stored in instance storage.
+///
+/// ## Field ordering
+/// Fields are ordered to minimise XDR-codec padding:
+/// - Hot path (accessed on every payout): `status`, balances, keys
+/// - Access-control & security: delegate, flags, archive
+/// - Cold / extended: history, router config, metadata hashes
+///
+/// ## Storage-tier note
+/// `payout_history` is cleared to an empty `Vec` on `archive_program` and
+/// migrated to `DataKey::ArchivedPayoutHistory` in **persistent** storage.
+/// After archival, use `get_archived_program_payout_history` to read it.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ProgramData {
+    // --- Identity ---
+    pub program_id: String,
     // --- Hot path: small fixed-size fields accessed on every operation ---
     pub status: ProgramStatus,
     pub remaining_balance: i128,
     pub total_funds: i128,
+    pub initial_liquidity: i128,
     pub authorized_payout_key: Address,
     pub token_address: Address,
     // --- Moderate: access-control and security fields ---
@@ -709,11 +783,17 @@ pub struct ProgramData {
     pub risk_flags: u32,
     pub archived: bool,
     pub archived_at: Option<u64>,
-    pub status: ProgramStatus,
     /// Optional per-program circuit breaker failure threshold.
     /// If set, overrides the global default (3) for this program.
     /// Must be between 1 and 100 inclusive when set.
     pub circuit_breaker_threshold: Option<u8>,
+    // --- Cold / extended fields ---
+    /// Full payout history (hot path until archival; cleared on `archive_program`).
+    pub payout_history: soroban_sdk::Vec<PayoutRecord>,
+    /// Optional reference hash for off-chain program metadata.
+    pub reference_hash: Option<soroban_sdk::Bytes>,
+    /// Optional fee-on-transfer router configuration.
+    pub fot_router: OptionalFotRouter,
 }
 
 // ========================================================================
@@ -2427,6 +2507,7 @@ impl ProgramEscrowContract {
             archived_at: None,
             status: ProgramStatus::Draft,
             circuit_breaker_threshold: None,
+            fot_router: OptionalFotRouter::None,
         };
 
         // Store program data in registry
@@ -2809,6 +2890,7 @@ impl ProgramEscrowContract {
                 archived_at: None,
                 status: ProgramStatus::Draft,
                 circuit_breaker_threshold: None,
+                fot_router: OptionalFotRouter::None,
             };
             let program_key = DataKey::Program(program_id.clone());
             env.storage().instance().set(&program_key, &program_data);

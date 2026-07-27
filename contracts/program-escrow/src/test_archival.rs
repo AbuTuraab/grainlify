@@ -25,7 +25,7 @@
 
 extern crate std;
 
-use soroban_sdk::{testutils::Address as _, vec, Address, Env, String};
+use soroban_sdk::{testutils::Address as _, Address, Env, String};
 
 use crate::{
     test_batch_operations::{init_program, setup, Ctx},
