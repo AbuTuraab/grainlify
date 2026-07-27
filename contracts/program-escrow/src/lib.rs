@@ -5279,17 +5279,54 @@ impl ProgramEscrowContract {
             .get(&PROGRAM_DATA)
             .unwrap_or_else(|| panic!("Program not initialized"));
 
-        // Load the set of consumed keys (Vec<String> stored persistently).
+        // ── Replay detection ───────────────────────────────────────────────
+        // Check the shared DataKey::IdempotencyKey namespace (instance storage)
+        // written by both single_payout_idempotent and batch_payout_internal.
+        if env
+            .storage()
+            .instance()
+            .has(&DataKey::IdempotencyKey(idempotency_key.clone()))
+        {
+            env.events().publish(
+                (BATCH_PAYOUT_REPLAYED,),
+                BatchPayoutReplayedEvent {
+                    version: EVENT_VERSION_V2,
+                    program_id: program_data.program_id.clone(),
+                    idempotency_key: idempotency_key.clone(),
+                },
+            );
+            return program_data;
+        }
+
+        // Check the legacy DataKey::PayoutIdempotency namespace (persistent
+        // storage) used exclusively by the original single_payout_idempotent.
+        if env
+            .storage()
+            .persistent()
+            .has(&DataKey::PayoutIdempotency(idempotency_key.clone()))
+        {
+            env.events().publish(
+                (BATCH_PAYOUT_REPLAYED,),
+                BatchPayoutReplayedEvent {
+                    version: EVENT_VERSION_V2,
+                    program_id: program_data.program_id.clone(),
+                    idempotency_key: idempotency_key.clone(),
+                },
+            );
+            return program_data;
+        }
+
+        // Load the set of batch-internal consumed keys (Vec<String> stored
+        // persistently).  This catches replay of a key consumed by a prior
+        // batch_payout_idempotent call on the same contract.
         let mut used_keys: soroban_sdk::Vec<String> = env
             .storage()
             .persistent()
             .get(&PAYOUT_IDEM_KEYS)
             .unwrap_or_else(|| soroban_sdk::Vec::new(&env));
 
-        // Replay detection: scan for the key.
         for k in used_keys.iter() {
             if k == idempotency_key {
-                // Emit audit event so auditors can confirm no double-payment.
                 env.events().publish(
                     (BATCH_PAYOUT_REPLAYED,),
                     BatchPayoutReplayedEvent {
@@ -6486,19 +6523,42 @@ impl ProgramEscrowContract {
         amount: i128,
         idempotency_key: Option<String>,
     ) -> ProgramData {
-        // Check if idempotency key already exists
+        // ── Replay detection ───────────────────────────────────────────────
+        // Check the shared DataKey::IdempotencyKey namespace (instance storage)
+        // first.  This catches replay of a key consumed by batch_payout_idempotent
+        // (or a prior single_payout_idempotent that stored via the shared path).
+        if let Some(ref key) = idempotency_key {
+            if let Some(record) = Self::get_idempotency_record(&env, key) {
+                let program_data: ProgramData = env
+                    .storage()
+                    .instance()
+                    .get(&PROGRAM_DATA)
+                    .unwrap_or_else(|| panic!("Program not initialized"));
+
+                env.events().publish(
+                    (symbol_short!("IdmReplay"),),
+                    (
+                        record.idempotency_key.clone(),
+                        record.program_id.clone(),
+                        record.total_amount,
+                    ),
+                );
+
+                return program_data;
+            }
+        }
+
+        // Check legacy DataKey::PayoutIdempotency namespace (persistent storage)
+        // for backwards compatibility with keys stored before the shared namespace.
         if let Some(existing_record) =
             Self::validate_and_get_idempotency_key(&env, &idempotency_key)
         {
-            // Key already used - return existing state without re-executing
-            // This ensures idempotent behavior
             let program_data: ProgramData = env
                 .storage()
                 .instance()
                 .get(&PROGRAM_DATA)
                 .unwrap_or_else(|| panic!("Program not initialized"));
 
-            // Emit event indicating idempotent replay
             env.events().publish(
                 (symbol_short!("IdmReplay"),),
                 (
@@ -6513,10 +6573,11 @@ impl ProgramEscrowContract {
 
         // Execute normal payout
         let program_data =
-            Self::single_payout_internal(env.clone(), caller, recipient.clone(), amount, None);
+            Self::single_payout_internal(env.clone(), caller.clone(), recipient.clone(), amount, None);
 
         // Store idempotency key if provided
         if let Some(key) = &idempotency_key {
+            // Legacy storage (DataKey::PayoutIdempotency, persistent)
             Self::store_idempotency_key(
                 &env,
                 key,
@@ -6524,9 +6585,22 @@ impl ProgramEscrowContract {
                 PayoutType::Single,
                 Some(recipient),
                 Some(amount),
-                None, // No batch recipients for single
-                None, // No batch amounts for single
+                None,
+                None,
                 amount,
+            );
+
+            // Shared namespace (DataKey::IdempotencyKey, instance) so that
+            // batch_payout_idempotent and is_payout_processed can detect it.
+            let executor = caller.unwrap_or_else(|| env.current_contract_address());
+            Self::store_idempotency_record(
+                &env,
+                key.clone(),
+                symbol_short!("singlepay"),
+                program_data.program_id.clone(),
+                amount,
+                1,
+                executor,
             );
         }
 
@@ -6600,10 +6674,34 @@ impl ProgramEscrowContract {
     /// Returns `true` if the key was previously recorded by a successful
     /// `single_payout_idempotent` or `batch_payout_idempotent` call.
     /// Returns `false` if the key is unknown (safe to submit).
+    ///
+    /// The shared namespace `DataKey::IdempotencyKey` is written by both
+    /// `single_payout_idempotent` (via `store_idempotency_record`) and
+    /// `batch_payout_idempotent` (via `batch_payout_internal` →
+    /// `store_idempotency_record`) so that a key consumed by one entrypoint
+    /// is visible to the other and to this view function.
+    ///
+    /// For backwards compatibility this function also checks the legacy
+    /// `DataKey::PayoutIdempotency` namespace, which was used exclusively
+    /// by the original `single_payout_idempotent` implementation.
     pub fn is_payout_processed(env: Env, idempotency_key: String) -> bool {
-        env.storage()
+        // 1. Shared namespace – instance storage (written by both entrypoints).
+        if env
+            .storage()
+            .instance()
+            .has(&DataKey::IdempotencyKey(idempotency_key.clone()))
+        {
+            return true;
+        }
+        // 2. Legacy single-payout namespace – persistent storage.
+        if env
+            .storage()
             .persistent()
-            .has(&DataKey::IdempotencyKey(idempotency_key))
+            .has(&DataKey::PayoutIdempotency(idempotency_key))
+        {
+            return true;
+        }
+        false
     }
 
     /// Create a release schedule entry that can be triggered at/after `release_timestamp`.
