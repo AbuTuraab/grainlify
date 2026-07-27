@@ -2079,6 +2079,8 @@ mod fot_routing;
 #[cfg(test)]
 mod test_fot_routing;
 mod threshold_monitor;
+#[cfg(test)]
+mod threshold_monitor_prop_tests;
 mod token_math;
 mod reputation;
 pub use reputation::{
@@ -8991,4 +8993,3 @@ mod test_event_ordering;
 #[cfg(test)]
 #[path = "release_schedule_host.rs"]
 mod release_schedule_host;
-
