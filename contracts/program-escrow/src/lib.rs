@@ -143,7 +143,7 @@
 use soroban_sdk::xdr::ToXdr;
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, panic_with_error, symbol_short, token, vec,
-    Address, BytesN, Env, String, Symbol, Vec,
+    Address, Bytes, BytesN, Env, String, Symbol, Vec,
 };
 
 mod errors;
@@ -160,7 +160,7 @@ pub use metadata::{
 
 mod dynamic_pricing;
 pub use dynamic_pricing::{
-    DynamicPricingConfig, PricingState, PricingEngine, PricingError,
+    DynamicPricingConfig, PricingState, PricingEngine,
     DemandMetrics, SupplyMetrics, OracleMarketData, PriceUpdateEvent,
     update_demand_metrics, update_supply_metrics, get_dynamic_fee,
 };
@@ -193,7 +193,7 @@ const CONTROLLER_PROPOSED: Symbol = symbol_short!("CtrlProp");
 const CONTROLLER_ACCEPTED: Symbol = symbol_short!("CtrlAcc");
 const CONTROLLER_ROTATION_CANCELLED: Symbol = symbol_short!("CtrlCanc");
 const PRICE_UPDATED: Symbol = symbol_short!("PriceUpd");
-const DYNAMIC_PRICING_CONFIG_UPDATED: Symbol = symbol_short!("DynPricCfg");
+const DYNAMIC_PRICING_CONFIG_UPDATED: Symbol = symbol_short!("DynPricCg");
 
 // Storage keys
 const PROGRAM_DATA: Symbol = symbol_short!("ProgData");
@@ -205,11 +205,8 @@ const PROGRAM_INDEX: Symbol = symbol_short!("ProgIdx");
 const AUTH_KEY_INDEX: Symbol = symbol_short!("AuthIdx");
 const FEE_CONFIG: Symbol = symbol_short!("FeeCfg");
 const FEE_COLLECTED: Symbol = symbol_short!("FeeCol");
-const DYNAMIC_PRICING_CONFIG: Symbol = symbol_short!("DynPric");
-const PRICING_STATE: Symbol = symbol_short!("PricSt");
-const DEMAND_METRICS: Symbol = symbol_short!("DmndMtr");
-const SUPPLY_METRICS: Symbol = symbol_short!("SuppMtr");
-const ORACLE_DATA: Symbol = symbol_short!("OraclD");
+/// Event symbol for insurance-reserve withdrawal audit events.
+const INSURANCE_RESERVE_WITHDRAWN: Symbol = symbol_short!("InsRsvWd");
 /// Storage key for the set of consumed idempotency keys (batch payout).
 const PAYOUT_IDEM_KEYS: Symbol = symbol_short!("PayIdem");
 /// Event symbol emitted when a batch_payout replay is detected.
@@ -294,6 +291,20 @@ pub struct FeeConfig {
     ///   bit 0 (`FEE_WAIVER_SINGLE`): waive fees for `PayoutType::Single`
     ///   bit 1 (`FEE_WAIVER_BATCH`):  waive fees for `PayoutType::Batch(_)`
     pub fee_waivers: u32,
+    /// Basis-point share of each collected fee that is carved out into the
+    /// on-chain insurance reserve instead of being forwarded to `fee_recipient`.
+    ///
+    /// Range: `0` (disabled, default) – `MAX_FEE_RATE` (10 %).
+    /// The carve-out is applied *after* the fee is computed:
+    ///
+    /// ```text
+    /// total_fee      = combined_fee_amount(gross, rate, fixed, enabled)
+    /// reserve_share  = ceil(total_fee * insurance_reserve_bps / BASIS_POINTS)
+    /// recipient_share = total_fee - reserve_share
+    /// ```
+    ///
+    /// Invariant: `reserve_share + recipient_share == total_fee` (no leakage).
+    pub insurance_reserve_bps: u32,
 }
 
 #[contracttype]
@@ -305,6 +316,28 @@ pub struct FeeCollectedEvent {
     pub fee_rate_bps: i128,
     pub fee_fixed: i128,
     pub recipient: Address,
+    pub timestamp: u64,
+}
+
+/// Emitted by `withdraw_insurance_reserve` (admin-gated).
+///
+/// Provides a full audit trail: who initiated the withdrawal, where funds
+/// went, how much was in the reserve before and after, and the ledger
+/// timestamp for cross-reference with the on-chain ledger sequence.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct InsuranceReserveWithdrawnEvent {
+    pub version: u32,
+    /// Admin address that authorised the withdrawal.
+    pub admin: Address,
+    /// Destination address that received the reserve funds.
+    pub target: Address,
+    /// Amount transferred out of the reserve.
+    pub amount: i128,
+    /// Reserve balance *before* this withdrawal.
+    pub balance_before: i128,
+    /// Reserve balance *after* this withdrawal (always 0 when `amount == balance_before`).
+    pub balance_after: i128,
     pub timestamp: u64,
 }
 // ==================== MONITORING MODULE ====================
@@ -690,11 +723,57 @@ pub enum ProgramStatus {
 /// # Example
 /// ```rust,ignore
 /// // Set custom threshold for a large program
-/// contract.set_program_circuit_breaker_threshold(&program_id, &Some(10u8));
+/// contract.set_program_circuit_breaker_threshold(&program_id, &Some(10u32));
 ///
 /// // Reset to global default
 /// contract.set_program_circuit_breaker_threshold(&program_id, &None);
 /// ```
+
+// ─────────────────────────────────────────────────────────────────────────────
+// FoT ROUTER TYPES
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Fee-on-transfer router configuration stored inside `ProgramData`.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FotRouter {
+    /// Address of the AMM / DEX router contract that exposes a `quote` function.
+    pub router_contract: Address,
+    /// Slippage tolerance in basis points (0 – 500, i.e. 0 – 5 %).
+    pub slippage_bps: u32,
+}
+
+/// Nullable wrapper for `FotRouter` stored inside `ProgramData`.
+///
+/// Soroban `contracttype` enums must be C-like (no `Option<T>` fields in
+/// top-level struct that hold non-scalar types), so we use an explicit
+/// two-variant enum instead of `Option<FotRouter>`.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum OptionalFotRouter {
+    None,
+    Some(FotRouter),
+}
+
+/// Event emitted when a FoT router is configured for the contract.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FotRouterSetEvent {
+    pub version: u32,
+    pub router_contract: Address,
+    pub slippage_bps: u32,
+    pub set_by: Address,
+    pub timestamp: u64,
+}
+
+/// Event emitted when the FoT router configuration is cleared.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FotRouterClearedEvent {
+    pub version: u32,
+    pub set_by: Address,
+    pub timestamp: u64,
+}
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -711,11 +790,18 @@ pub struct ProgramData {
     pub risk_flags: u32,
     pub archived: bool,
     pub archived_at: Option<u64>,
-    pub status: ProgramStatus,
+    // --- Program identity and history ---
+    pub program_id: String,
+    pub payout_history: soroban_sdk::Vec<PayoutRecord>,
+    pub initial_liquidity: i128,
+    pub reference_hash: Option<soroban_sdk::Bytes>,
     /// Optional per-program circuit breaker failure threshold.
     /// If set, overrides the global default (3) for this program.
     /// Must be between 1 and 100 inclusive when set.
-    pub circuit_breaker_threshold: Option<u8>,
+    /// Stored as u32 because Soroban SDK does not support u8 in contracttype.
+    pub circuit_breaker_threshold: Option<u32>,
+    /// Optional FoT router configuration for fee-on-transfer token handling.
+    pub fot_router: OptionalFotRouter,
 }
 
 // ========================================================================
@@ -870,9 +956,9 @@ pub struct CircuitBreakerThresholdSetEvent {
     /// Program the threshold applies to.
     pub program_id: String,
     /// Previous threshold value (None = not set, uses global default of 3).
-    pub previous_threshold: Option<u8>,
+    pub previous_threshold: Option<u32>,
     /// New threshold value (None = reset to global default of 3).
-    pub new_threshold: Option<u8>,
+    pub new_threshold: Option<u32>,
     /// Admin that made the change.
     pub set_by: Address,
     /// Ledger timestamp.
@@ -1229,7 +1315,6 @@ pub enum DataKey {
     NextScheduleId(String),          // program_id -> next schedule_id
     MultisigConfig(String),          // program_id -> MultisigConfig
     SplitConfig(String),             // program_id -> SplitConfig (payout splits)
-    PayoutApproval(String, Address), // program_id, recipient -> PayoutApproval
     PendingClaim(String, u64),       // (program_id, schedule_id) -> ClaimRecord
     ClaimWindow,                     // u64 seconds (global config)
     PauseFlags,                      // PauseFlags struct
@@ -1238,12 +1323,15 @@ pub enum DataKey {
     ProgramDependencies(String),     // program_id -> Vec<String>
     DependencyStatus(String),        // program_id -> DependencyStatus
     Dispute,                         // DisputeRecord (single active dispute per contract)
-    DisputeRecord(String),           // DisputeRecord (single active dispute per contract)
     PayoutIdempotency(String),       // idempotency_key -> PayoutIdempotencyKey
     HistoryPaginationConfig,         // HistoryPaginationConfig
     SpendLimitSchemaVersion,
     PauseSchemaVersion,
     TokenAllowlist,
+    /// V2 token allowlist storing `AllowedTokenEntry` (includes decimals).
+    TokenAllowlistV2,
+    /// Per-token decimal precision cache; key is the token contract address.
+    TokenDecimals(Address),
     /// Dynamic pricing configuration
     DynamicPricingConfig,
     /// Dynamic pricing state
@@ -1298,6 +1386,16 @@ pub enum DataKey {
     /// enabling dwell-time queries for ecosystem operators.
     /// Written on each status change; read via get_program_lifecycle_timeline.
     LifecycleTimeline(String),
+
+    /// Accumulated insurance-reserve balance in native token units.
+    ///
+    /// Written atomically with every fee-collection operation that has a
+    /// non-zero `insurance_reserve_bps`.  Read by `get_insurance_reserve_balance`.
+    /// Never decremented except by `withdraw_insurance_reserve` (admin-gated).
+    ///
+    /// Stored in `instance` storage so it shares the contract TTL and is
+    /// always co-located with `FeeConfig`.
+    InsuranceReserve,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1350,6 +1448,15 @@ pub struct AnonymousResolverRemovedEvent {
 
 const ANONYMOUS_RESOLVER_SET: Symbol = symbol_short!("AnonRslvS");
 const ANONYMOUS_RESOLVER_REMOVED: Symbol = symbol_short!("AnonRslvR");
+
+/// Delegate info for a single program, returned by `query_program_delegates`.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProgramDelegateInfo {
+    pub program_id: String,
+    pub delegate: Option<Address>,
+    pub permissions: u32,
+}
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -2357,6 +2464,7 @@ impl ProgramEscrowContract {
                     fee_recipient: authorized_payout_key.clone(),
                     fee_enabled: false,
                     fee_waivers: 0,
+                    insurance_reserve_bps: 0,
                 },
             );
         }
@@ -2385,7 +2493,16 @@ impl ProgramEscrowContract {
                     panic!("Lock fee consumes entire initial liquidity");
                 }
                 if fee > 0 {
-                    token_client.transfer(&contract_address, &cfg.fee_recipient, &fee);
+                    let (reserve_share, recipient_share) =
+                        Self::split_fee_for_reserve(fee, cfg.insurance_reserve_bps);
+                    if recipient_share > 0 {
+                        token_client.transfer(
+                            &contract_address,
+                            &cfg.fee_recipient,
+                            &recipient_share,
+                        );
+                    }
+                    Self::accrue_insurance_reserve(&env, reserve_share);
                     Self::emit_fee_collected(
                         &env,
                         symbol_short!("lock"),
@@ -2417,6 +2534,7 @@ impl ProgramEscrowContract {
             archived_at: None,
             status: ProgramStatus::Draft,
             circuit_breaker_threshold: None,
+            fot_router: OptionalFotRouter::None,
         };
 
         // Store program data in registry
@@ -2473,6 +2591,7 @@ impl ProgramEscrowContract {
                     fee_recipient: authorized_payout_key.clone(),
                     fee_enabled: false,
                     fee_waivers: 0,
+                    insurance_reserve_bps: 0,
                 },
             );
         }
@@ -2802,6 +2921,7 @@ impl ProgramEscrowContract {
                 archived_at: None,
                 status: ProgramStatus::Draft,
                 circuit_breaker_threshold: None,
+                fot_router: OptionalFotRouter::None,
             };
             let program_key = DataKey::Program(program_id.clone());
             env.storage().instance().set(&program_key, &program_data);
@@ -2823,6 +2943,7 @@ impl ProgramEscrowContract {
                     fee_recipient: authorized_payout_key.clone(),
                     fee_enabled: false,
                     fee_waivers: 0,
+                    insurance_reserve_bps: 0,
                 };
                 env.storage().instance().set(&FEE_CONFIG, &fee_config);
             }
@@ -2928,7 +3049,16 @@ impl ProgramEscrowContract {
             };
 
             if fee_amount > 0 {
-                token_client.transfer(&contract_address, &fee_config.fee_recipient, &fee_amount);
+                let (reserve_share, recipient_share) =
+                    Self::split_fee_for_reserve(fee_amount, fee_config.insurance_reserve_bps);
+                if recipient_share > 0 {
+                    token_client.transfer(
+                        &contract_address,
+                        &fee_config.fee_recipient,
+                        &recipient_share,
+                    );
+                }
+                Self::accrue_insurance_reserve(&env, reserve_share);
                 Self::emit_fee_collected(
                     &env,
                     symbol_short!("lock"),
@@ -3143,6 +3273,110 @@ impl ProgramEscrowContract {
         );
     }
 
+    // ── Insurance reserve helpers ────────────────────────────────────────────
+
+    /// Split `total_fee` into `(reserve_share, recipient_share)` using ceiling
+    /// division for the reserve so no dust is lost.
+    ///
+    /// Invariant: `reserve_share + recipient_share == total_fee`.
+    fn split_fee_for_reserve(total_fee: i128, insurance_reserve_bps: u32) -> (i128, i128) {
+        if insurance_reserve_bps == 0 || total_fee <= 0 {
+            return (0, total_fee);
+        }
+        // Ceiling division: reserve_share = ceil(total_fee * bps / BASIS_POINTS)
+        let bps = insurance_reserve_bps as i128;
+        let numerator = total_fee
+            .checked_mul(bps)
+            .and_then(|n| n.checked_add(BASIS_POINTS - 1))
+            .expect("Insurance reserve split overflow");
+        let reserve_share = numerator / BASIS_POINTS;
+        let recipient_share = total_fee - reserve_share;
+        (reserve_share, recipient_share)
+    }
+
+    /// Accrue `amount` into the on-chain insurance reserve.
+    fn accrue_insurance_reserve(env: &Env, amount: i128) {
+        if amount <= 0 {
+            return;
+        }
+        let current: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::InsuranceReserve)
+            .unwrap_or(0);
+        let next = current
+            .checked_add(amount)
+            .expect("Insurance reserve overflow");
+        env.storage()
+            .instance()
+            .set(&DataKey::InsuranceReserve, &next);
+    }
+
+    /// Read the current insurance reserve balance (token units).
+    pub fn get_insurance_reserve_balance(env: Env) -> i128 {
+        env.storage()
+            .instance()
+            .get(&DataKey::InsuranceReserve)
+            .unwrap_or(0)
+    }
+
+    /// Withdraw the full (or partial) insurance reserve to `target` (admin-only).
+    ///
+    /// Authorization level mirrors `emergency_withdraw`: the contract admin must
+    /// sign.  The contract must **not** need to be paused — reserve withdrawals
+    /// are an independent admin operation to avoid mixing operational and
+    /// financial-hygiene concerns.
+    ///
+    /// Emits `InsuranceReserveWithdrawnEvent` for audit purposes.
+    pub fn withdraw_insurance_reserve(env: Env, target: Address, amount: i128) {
+        if !env.storage().instance().has(&DataKey::Admin) {
+            panic!("Not initialized");
+        }
+        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        admin.require_auth();
+
+        if amount <= 0 {
+            panic_with_error!(&env, &ContractError::InvalidAmount);
+        }
+
+        let balance_before: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::InsuranceReserve)
+            .unwrap_or(0);
+
+        if amount > balance_before {
+            panic_with_error!(&env, &ContractError::InsufficientInsuranceReserve);
+        }
+
+        let balance_after = balance_before - amount;
+        env.storage()
+            .instance()
+            .set(&DataKey::InsuranceReserve, &balance_after);
+
+        // Determine the token to use from the legacy PROGRAM_DATA or any registered program.
+        let program_data: ProgramData = env
+            .storage()
+            .instance()
+            .get(&PROGRAM_DATA)
+            .unwrap_or_else(|| panic!("Program not initialized"));
+        let token_client = token::Client::new(&env, &program_data.token_address);
+        token_client.transfer(&env.current_contract_address(), &target, &amount);
+
+        env.events().publish(
+            (INSURANCE_RESERVE_WITHDRAWN,),
+            InsuranceReserveWithdrawnEvent {
+                version: EVENT_VERSION_V2,
+                admin,
+                target,
+                amount,
+                balance_before,
+                balance_after,
+                timestamp: env.ledger().timestamp(),
+            },
+        );
+    }
+
     /// Get fee configuration (internal helper)
     fn get_fee_config_internal(env: &Env) -> FeeConfig {
         env.storage()
@@ -3156,6 +3390,7 @@ impl ProgramEscrowContract {
                 fee_recipient: env.current_contract_address(),
                 fee_enabled: false,
                 fee_waivers: 0,
+                insurance_reserve_bps: 0,
             })
     }
 
@@ -3165,6 +3400,15 @@ impl ProgramEscrowContract {
     }
 
     /// Update fee parameters (admin only). `None` leaves a field unchanged.
+    ///
+    /// # `insurance_reserve_bps`
+    /// When set to a non-zero value, each subsequent fee collection will split the
+    /// collected fee: a `insurance_reserve_bps / BASIS_POINTS` share is added to
+    /// the on-chain `InsuranceReserve` balance (query via `get_insurance_reserve_balance`)
+    /// and the remainder is forwarded to `fee_recipient` as before.
+    ///
+    /// Validation rules (checked after all `Some` fields are merged):
+    /// - `insurance_reserve_bps` must not exceed `MAX_FEE_RATE` (1 000, i.e. 10 %).
     pub fn update_fee_config(
         env: Env,
         lock_fee_rate: Option<i128>,
@@ -3173,6 +3417,7 @@ impl ProgramEscrowContract {
         payout_fixed_fee: Option<i128>,
         fee_recipient: Option<Address>,
         fee_enabled: Option<bool>,
+        insurance_reserve_bps: Option<u32>,
     ) {
         Self::require_admin(&env);
         let mut cfg = Self::get_fee_config_internal(&env);
@@ -3206,6 +3451,12 @@ impl ProgramEscrowContract {
         }
         if let Some(e) = fee_enabled {
             cfg.fee_enabled = e;
+        }
+        if let Some(bps) = insurance_reserve_bps {
+            if bps as i128 > MAX_FEE_RATE {
+                panic_with_error!(&env, &ContractError::InvalidInsuranceReserveBps);
+            }
+            cfg.insurance_reserve_bps = bps;
         }
         env.storage().instance().set(&FEE_CONFIG, &cfg);
     }
@@ -3306,7 +3557,16 @@ impl ProgramEscrowContract {
         let contract_address = env.current_contract_address();
         let token_client = token::Client::new(&env, &program_data.token_address);
         if fee_amount > 0 {
-            token_client.transfer(&contract_address, &fee_config.fee_recipient, &fee_amount);
+            let (reserve_share, recipient_share) =
+                Self::split_fee_for_reserve(fee_amount, fee_config.insurance_reserve_bps);
+            if recipient_share > 0 {
+                token_client.transfer(
+                    &contract_address,
+                    &fee_config.fee_recipient,
+                    &recipient_share,
+                );
+            }
+            Self::accrue_insurance_reserve(&env, reserve_share);
             Self::emit_fee_collected(
                 &env,
                 symbol_short!("lock"),
@@ -5175,10 +5435,10 @@ impl ProgramEscrowContract {
     ///
     /// # Events
     /// Emits `CB_THRESHOLD_SET` with [`CircuitBreakerThresholdSetEvent`].
-    pub fn set_program_circuit_breaker_threshold(
+    pub fn set_prog_cb_threshold(
         env: Env,
         program_id: String,
-        threshold: Option<u8>,
+        threshold: Option<u32>,
     ) {
         let program_data = Self::get_program_data_by_id(&env, &program_id);
         program_data.authorized_payout_key.require_auth();
@@ -6119,7 +6379,16 @@ impl ProgramEscrowContract {
             let _gross = amounts.get(i).unwrap();
 
             if pay_fee > 0 {
-                token_client.transfer(&contract_address, &cfg.fee_recipient, &pay_fee);
+                let (reserve_share, recipient_share) =
+                    Self::split_fee_for_reserve(pay_fee, cfg.insurance_reserve_bps);
+                if recipient_share > 0 {
+                    token_client.transfer(
+                        &contract_address,
+                        &cfg.fee_recipient,
+                        &recipient_share,
+                    );
+                }
+                Self::accrue_insurance_reserve(&env, reserve_share);
                 Self::emit_fee_collected(
                     &env,
                     symbol_short!("payout"),
@@ -6397,7 +6666,12 @@ impl ProgramEscrowContract {
         }
 
         if pay_fee > 0 {
-            token_client.transfer(&contract_address, &cfg.fee_recipient, &pay_fee);
+            let (reserve_share, recipient_share) =
+                Self::split_fee_for_reserve(pay_fee, cfg.insurance_reserve_bps);
+            if recipient_share > 0 {
+                token_client.transfer(&contract_address, &cfg.fee_recipient, &recipient_share);
+            }
+            Self::accrue_insurance_reserve(&env, reserve_share);
             Self::emit_fee_collected(
                 &env,
                 symbol_short!("payout"),
@@ -7189,7 +7463,16 @@ impl ProgramEscrowContract {
         };
 
         if fee_amount > 0 {
-            token_client.transfer(&contract_address, &fee_config.fee_recipient, &fee_amount);
+            let (reserve_share, recipient_share) =
+                Self::split_fee_for_reserve(fee_amount, fee_config.insurance_reserve_bps);
+            if recipient_share > 0 {
+                token_client.transfer(
+                    &contract_address,
+                    &fee_config.fee_recipient,
+                    &recipient_share,
+                );
+            }
+            Self::accrue_insurance_reserve(&env, reserve_share);
         }
 
         program_data.total_funds = program_data
@@ -8202,54 +8485,30 @@ impl ProgramEscrowContract {
     /// Emits `DynPricCfg` with configuration details.
     pub fn configure_dynamic_pricing(
         env: Env,
-        enabled: bool,
-        base_fee_bps: i128,
-        max_fee_bps: i128,
-        min_fee_bps: i128,
-        max_change_bps: i128,
-        smoothing_alpha_bps: i128,
-        min_update_interval: u64,
-        oracle_address: Option<Address>,
-        use_demand_pricing: bool,
-        use_supply_pricing: bool,
-        use_time_decay: bool,
+        config: DynamicPricingConfig,
     ) {
         let admin = Self::require_admin(&env);
 
         // Validate configuration parameters
-        if base_fee_bps < 0 || base_fee_bps > 10000 {
+        if config.base_fee_bps < 0 || config.base_fee_bps > 10000 {
             panic!("Invalid base fee rate");
         }
-        if max_fee_bps < min_fee_bps {
+        if config.max_fee_bps < config.min_fee_bps {
             panic!("Max fee must be >= min fee");
         }
-        if max_change_bps < 0 || max_change_bps > 10000 {
+        if config.max_change_bps < 0 || config.max_change_bps > 10000 {
             panic!("Invalid max change rate");
         }
-        if smoothing_alpha_bps < 0 || smoothing_alpha_bps > 10000 {
+        if config.smoothing_alpha_bps < 0 || config.smoothing_alpha_bps > 10000 {
             panic!("Invalid smoothing alpha");
         }
-        if min_update_interval == 0 {
+        if config.min_update_interval == 0 {
             panic!("Min update interval must be > 0");
         }
 
-        let config = DynamicPricingConfig {
-            enabled,
-            base_fee_bps,
-            max_fee_bps,
-            min_fee_bps,
-            max_change_bps,
-            smoothing_alpha_bps,
-            min_update_interval,
-            oracle_address,
-            use_demand_pricing,
-            use_supply_pricing,
-            use_time_decay,
-        };
-
         // Initialize pricing state if not exists
         if !env.storage().instance().has(&DataKey::PricingState) {
-            let initial_state = PricingState::initial(&env, base_fee_bps);
+            let initial_state = PricingState::initial(&env, config.base_fee_bps);
             env.storage().instance().set(&DataKey::PricingState, &initial_state);
         }
 
@@ -8258,13 +8517,13 @@ impl ProgramEscrowContract {
         env.events().publish(
             (DYNAMIC_PRICING_CONFIG_UPDATED,),
             (
-                enabled,
-                base_fee_bps,
-                max_fee_bps,
-                min_fee_bps,
-                max_change_bps,
-                smoothing_alpha_bps,
-                min_update_interval,
+                config.enabled,
+                config.base_fee_bps,
+                config.max_fee_bps,
+                config.min_fee_bps,
+                config.max_change_bps,
+                config.smoothing_alpha_bps,
+                config.min_update_interval,
                 admin,
                 env.ledger().timestamp(),
             ),
@@ -8498,6 +8757,9 @@ mod test_dynamic_pricing;
 #[cfg(test)]
 mod test_batch_operations;
 // #[cfg(test)] mod test_pause;
+
+#[cfg(test)]
+mod test_insurance_reserve;
 
 #[cfg(test)]
 #[cfg(any())]
