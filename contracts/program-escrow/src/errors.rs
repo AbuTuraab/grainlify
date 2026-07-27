@@ -688,7 +688,12 @@ pub enum ContractError {
     InvalidRoleProposal = 1207,
     RoleRotationNotAllowed = 1208,
 
-    /// Rotation timelock has not yet expired.
+    /// FoT (fee-on-transfer) routing failed.
+    ///
+    /// This error occurs when the fee-on-transfer router cannot process the transfer.
+    FotRoutingFailed = 1209,
+
+    /// Role rotation timelock is active.
     ///
     /// This error occurs when role rotation is temporarily disabled
     /// due to contract state (e.g., emergency mode, dispute, etc.).
