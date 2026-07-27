@@ -943,11 +943,43 @@ pub struct TokenAllowlistSchemaVersionSet {
 const TOKEN_ALLOWLIST_UPDATED: Symbol = symbol_short!("TkAllow");
 const TOKEN_REJECTED: Symbol = symbol_short!("TkReject");
 const TOKEN_ALLOWLIST_SCHEMA: Symbol = symbol_short!("TkAlSch");
+const TOKEN_DECIMALS_CONFIGURED: Symbol = symbol_short!("TkDecCfg");
+const TOKEN_DECIMALS_MISMATCH: Symbol = symbol_short!("TkDecMis");
 
 /// Current token-allowlist storage schema version.
 ///
 /// Increment whenever the allowlist storage layout changes in a breaking way.
 pub const TOKEN_ALLOWLIST_SCHEMA_VERSION_V1: u32 = 1;
+
+/// Records a one-time decimals configuration for an allowlisted token.
+///
+/// `reported_decimals` is populated only when the token implements the
+/// standard `decimals()` view.  The configured value remains authoritative for
+/// historical display: it is intentionally immutable once stored.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TokenDecimalsConfiguredEvent {
+    pub version: u32,
+    pub token: Address,
+    pub configured_decimals: u32,
+    pub reported_decimals: Option<u32>,
+    pub configured_by: Address,
+    pub timestamp: u64,
+}
+
+/// Warns indexers that the configured display scale disagrees with the token's
+/// `decimals()` view. The registration is retained because custom tokens may
+/// deliberately use an application-specific accounting scale.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TokenDecimalsMismatchEvent {
+    pub version: u32,
+    pub token: Address,
+    pub configured_decimals: u32,
+    pub reported_decimals: u32,
+    pub configured_by: Address,
+    pub timestamp: u64,
+}
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1019,6 +1051,9 @@ pub enum DataKey {
     PendingAdmin,
     /// Pending controller address for two-step controller rotation (step 1).
     PendingController(String),
+    /// Immutable, admin-configured display scale for an allowlisted token.
+    /// Appended to preserve the XDR discriminants of all existing keys.
+    TokenDecimals(Address),
 }
 
 #[contracttype]
@@ -4152,6 +4187,109 @@ impl ProgramEscrowContract {
         );
     }
 
+    /// Add an allowed token and permanently bind its human-readable decimal
+    /// scale (admin only).
+    ///
+    /// Raw token amounts are always transferred and stored as `i128`; decimals
+    /// are metadata used by indexers and UIs to render those raw amounts.  The
+    /// value is therefore stored instead of read live at display time: a token
+    /// contract can be upgraded, replaced, or expose no standard `decimals()`
+    /// view, while historical payouts must retain their original interpretation.
+    ///
+    /// A configured value is immutable. Re-registering the same token with the
+    /// same value is idempotent, but a different value panics with
+    /// `"Token decimals are immutable"`. This deliberately has no migration
+    /// shortcut: changing a scale would reinterpret every historical raw
+    /// payout. A migration must use a new token address and a new configuration.
+    ///
+    /// If the token implements the standard `decimals()` view, the result is
+    /// compared with `decimals`. A disagreement emits
+    /// [`TokenDecimalsMismatchEvent`] for monitoring but is not blocking, since
+    /// some supported tokens use an application-defined accounting scale.
+    ///
+    /// # Events
+    /// Emits [`TokenDecimalsConfiguredEvent`] for a new configuration and
+    /// [`TokenDecimalsMismatchEvent`] when the optional live check disagrees.
+    pub fn add_allowed_token_with_decimals(env: Env, token: Address, decimals: u32) {
+        let admin = Self::require_admin(&env);
+        let key = DataKey::TokenDecimals(token.clone());
+
+        if let Some(existing) = env.storage().instance().get::<DataKey, u32>(&key) {
+            if existing != decimals {
+                panic!("Token decimals are immutable");
+            }
+            return;
+        }
+
+        let mut allowlist = Self::get_token_allowlist_internal(&env);
+        let mut already_allowed = false;
+        for existing in allowlist.iter() {
+            if existing == token {
+                already_allowed = true;
+                break;
+            }
+        }
+        if !already_allowed {
+            allowlist.push_back(token.clone());
+            env.storage()
+                .instance()
+                .set(&DataKey::TokenAllowlist, &allowlist);
+            env.events().publish(
+                (TOKEN_ALLOWLIST_UPDATED,),
+                TokenAllowlistUpdatedEvent {
+                    version: EVENT_VERSION_V2,
+                    token: token.clone(),
+                    added: true,
+                    updated_by: admin.clone(),
+                    timestamp: env.ledger().timestamp(),
+                },
+            );
+        }
+
+        // `try_decimals` makes this check best-effort: non-standard token
+        // contracts remain usable, but standard-token disagreements are visible
+        // to indexers and operational monitoring.
+        let reported_decimals = token::Client::new(&env, &token).try_decimals().ok();
+        env.storage().instance().set(&key, &decimals);
+        env.events().publish(
+            (TOKEN_DECIMALS_CONFIGURED,),
+            TokenDecimalsConfiguredEvent {
+                version: EVENT_VERSION_V2,
+                token: token.clone(),
+                configured_decimals: decimals,
+                reported_decimals,
+                configured_by: admin.clone(),
+                timestamp: env.ledger().timestamp(),
+            },
+        );
+
+        if let Some(reported_decimals) = reported_decimals {
+            if reported_decimals != decimals {
+                env.events().publish(
+                    (TOKEN_DECIMALS_MISMATCH,),
+                    TokenDecimalsMismatchEvent {
+                        version: EVENT_VERSION_V2,
+                        token,
+                        configured_decimals: decimals,
+                        reported_decimals,
+                        configured_by: admin,
+                        timestamp: env.ledger().timestamp(),
+                    },
+                );
+            }
+        }
+    }
+
+    /// Return the immutable configured decimal scale for `token`.
+    ///
+    /// Returns `None` for legacy allowlist entries added with
+    /// [`add_allowed_token`] or for tokens that have not been configured.
+    pub fn get_token_decimals(env: Env, token: Address) -> Option<u32> {
+        env.storage()
+            .instance()
+            .get(&DataKey::TokenDecimals(token))
+    }
+
     /// Remove a token contract address from the allowlist (admin only).
     ///
     /// If removing the last token, the allowlist becomes empty and enforcement
@@ -6263,6 +6401,8 @@ pub fn preview_split(
 
 #[cfg(test)]
 mod test;
+#[cfg(test)]
+mod test_token_allowlist;
 mod test_pagination;
 // Pre-existing broken test modules excluded until their referenced types/methods are implemented:
 // #[cfg(test)] mod test_archival;
