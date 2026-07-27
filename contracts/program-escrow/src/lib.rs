@@ -1472,14 +1472,6 @@ const ANONYMOUS_RESOLVER_REMOVED: Symbol = symbol_short!("AnonRslvR");
 /// Delegate info for a single program, returned by `query_program_delegates`.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ProgramDelegateInfo {
-    pub program_id: String,
-    pub delegate: Option<Address>,
-    pub permissions: u32,
-}
-
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PauseFlags {
     pub lock_paused: bool,
     pub release_paused: bool,
