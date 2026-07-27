@@ -3720,7 +3720,16 @@ impl BountyEscrowContract {
         }
     }
 
-    /// Update multisig configuration (admin only)
+    /// Update multisig configuration (admin only).
+    ///
+    /// # Live-threshold semantics
+    /// The `required_signatures` threshold is enforced at execution time
+    /// (in `execute_queued_release`), not at approval-queue time. This means:
+    /// - Lowering `required_signatures` can make a previously-blocked release
+    ///   executable without requiring new approvals.
+    /// - Raising `required_signatures` can block a previously-queued release
+    ///   even if enough approvals were collected under the old threshold.
+    /// - Changing the signer set does not invalidate existing approvals.
     pub fn update_multisig_config(
         env: Env,
         threshold_amount: i128,
@@ -7509,6 +7518,9 @@ impl BountyEscrowContract {
     ///
     /// Anyone may call this after `executable_at`; the admin queued the release
     /// via `release_funds` and the timelock enforces the delay.
+    /// Also enforces multisig threshold (live-threshold semantics) —
+    /// at execution time, the number of approvals must meet
+    /// `MultisigConfig.required_signatures`.
     /// Applies release fees consistently with the standard `release_funds` path.
     pub fn execute_queued_release(env: Env, bounty_id: u64) -> Result<(), Error> {
         reentrancy_guard::acquire(&env);
@@ -7526,6 +7538,25 @@ impl BountyEscrowContract {
 
             if env.ledger().timestamp() < queued.executable_at {
                 return Err(Error::TimelockNotElapsed);
+            }
+
+            // Multisig threshold enforcement (live-threshold semantics):
+            // the approval threshold at execution time governs, not at queue time.
+            let multisig_config = Self::get_multisig_config(env.clone());
+            if multisig_config.required_signatures > 0 {
+                let approval_key = DataKey::ReleaseApproval(bounty_id);
+                let approval: ReleaseApproval = env
+                    .storage()
+                    .persistent()
+                    .get(&approval_key)
+                    .unwrap_or(ReleaseApproval {
+                        bounty_id,
+                        contributor: queued.contributor.clone(),
+                        approvals: vec![&env],
+                    });
+                if (approval.approvals.len() as u32) < multisig_config.required_signatures {
+                    return Err(Error::Unauthorized);
+                }
             }
 
             let mut escrow: Escrow = env
