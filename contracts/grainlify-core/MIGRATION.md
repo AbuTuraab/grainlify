@@ -134,6 +134,66 @@ Steps 4 and 5 are independent. `upgrade` replaces the WASM; `migrate` transforms
 3. **Version monotonicity** — The contract enforces forward-only migrations. There is no on-chain rollback of state; rollback requires deploying a previous WASM and manually reversing state changes.
 4. **Idempotency scope** — Idempotency is per `to_version`. A migration to v3 followed by a migration to v4 are two distinct operations, each recorded separately.
 5. **No key mutations** — Migration functions must not rename or remove `DataKey` variants. New storage keys must use new enum variants.
+6. **Ledger timestamp monotonicity** — The migration expiry mechanism (`expires_at` derived from `env.ledger().timestamp()`) assumes that the ledger timestamp never moves backward in a way that reopens a closed expiry window. Stellar test networks periodically reset their ledger timestamps, which can cause `expires_at` values that were in the past relative to the pre-reset timestamp to appear in the future relative to the post-reset timestamp. **The contract includes defense-in-depth protections against this scenario.**
+
+### Ledger Timestamp Reset Protection
+
+The contract implements multiple defense-in-depth mechanisms to protect against replay attacks when ledger timestamps move backward:
+
+#### Primary Protection: Commitment Consumption on Expiry Failure
+
+When `migrate()` detects that a commitment has expired (`env.ledger().timestamp() > commitment.expires_at`), it **consumes the commitment even on failure** by deleting it from storage. This ensures that even if a timestamp reset moves the current timestamp backward into the original expiry window, the commitment cannot be replayed because it no longer exists.
+
+```rust
+if commitment.expires_at > 0 && env.ledger().timestamp() > commitment.expires_at {
+    // Consume commitment even on expiry failure to prevent replay
+    // after a ledger-timestamp reset.
+    env.storage().instance().remove(&DataKey::MigrationCommitment(target_version));
+    panic!("Migration commitment has expired");
+}
+```
+
+#### Secondary Protection: Hash Verification Independence
+
+The migration hash check is completely independent of timestamp checks. Even if a timestamp reset were to somehow bypass the expiry check, the hash verification would still prevent replay of an unintended migration payload:
+
+```rust
+if commitment.hash != migration_hash {
+    panic!("{}", ContractError::MigrationHashMismatch as u32);
+}
+```
+
+This means:
+- A hash committed for version 3 cannot be used to migrate to version 4 (version isolation)
+- A different hash cannot be used with an existing commitment (hash binding)
+- The hash check works even when `expires_at = 0` (no expiry)
+
+#### Tertiary Protection: Commitment Consumption on Success
+
+After a successful migration, the commitment is always consumed:
+
+```rust
+// Consume commitment (replay protection)
+env.storage().instance().remove(&DataKey::MigrationCommitment(target_version));
+```
+
+This prevents replay of the same migration even if no expiry was set.
+
+### Trust Assumptions by Environment
+
+| Environment | Timestamp Monotonicity | Protection Strategy |
+|-------------|----------------------|---------------------|
+| Stellar Mainnet | ✅ Monotonic (guaranteed) | Expiry check alone is sufficient |
+| Stellar Testnet | ❌ Periodic resets | Defense-in-depth required (commitment consumption + hash verification) |
+| Local Development | ⚠️ Depends on test setup | Use short TTLs or no expiry for testing |
+
+### Recommended Practices
+
+1. **Use short expiry TTLs** in test environments to minimize the window for potential replay
+2. **Always verify migration_hash** off-chain before and after migration execution
+3. **Monitor for expiry failures** - if a migration fails due to expiry, the commitment is consumed and must be re-committed
+4. **Use `expires_at = 0`** (no expiry) only in controlled environments where timestamp monotonicity is guaranteed
+5. **Never reuse a migration hash** across different target versions or migration attempts
 
 ---
 
@@ -148,5 +208,6 @@ cargo test --lib
 
 Key test modules:
 - `src/migration_hook_tests.rs` — idempotency, auth, event emission, edge cases
+- `src/test_migration_replay.rs` — replay protection, ledger-timestamp reset safety, hash-only replay prevention
 - `src/test/e2e_upgrade_migration_tests.rs` — end-to-end lifecycle scenarios
 - `src/lib.rs` (inline `mod test`) — integration and regression tests
