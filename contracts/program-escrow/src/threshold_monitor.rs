@@ -16,6 +16,7 @@ use soroban_sdk::{contracttype, symbol_short, Address, Env, Symbol};
 /// Configuration for threshold-based circuit breaking
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
+    pub struct ThresholdConfig {
     pub outflow_volume_threshold: i128,
     /// Maximum amount for a single payout transaction
     pub max_single_payout: i128,
