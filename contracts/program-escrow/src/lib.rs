@@ -7142,8 +7142,13 @@ impl ProgramEscrowContract {
 
     /// Get program information
     ///
+    /// # Deprecation Note
+    /// This is the legacy singleton accessor. Use `get_program_info_v2` which
+    /// reads from `DataKey::Program(id)` instead.
+    ///
     /// # Returns
     /// ProgramData containing all program information
+    #[deprecated(note = "Use get_program_info_v2 instead")]
     pub fn get_program_info(env: Env) -> ProgramData {
         env.storage()
             .instance()
