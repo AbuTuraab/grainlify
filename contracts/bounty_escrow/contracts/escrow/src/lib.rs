@@ -3720,16 +3720,7 @@ impl BountyEscrowContract {
         }
     }
 
-    /// Update multisig configuration (admin only).
-    ///
-    /// # Live-threshold semantics
-    /// The `required_signatures` threshold is enforced at execution time
-    /// (in `execute_queued_release`), not at approval-queue time. This means:
-    /// - Lowering `required_signatures` can make a previously-blocked release
-    ///   executable without requiring new approvals.
-    /// - Raising `required_signatures` can block a previously-queued release
-    ///   even if enough approvals were collected under the old threshold.
-    /// - Changing the signer set does not invalidate existing approvals.
+    /// Update multisig configuration (admin only)
     pub fn update_multisig_config(
         env: Env,
         threshold_amount: i128,
@@ -6857,8 +6848,55 @@ impl BountyEscrowContract {
     /// Return the current per-operation gas budget configuration.
     ///
     /// Returns the fully uncapped default if no configuration has been set.
+    ///
+    /// ## ⚠ Production note
+    ///
+    /// The returned caps are **advisory-only** on the live network. CPU and
+    /// memory measurement requires `env.budget()`, which is only available
+    /// under the `testutils` feature. Call
+    /// [`get_gas_budget_advisory_status`](Self::get_gas_budget_advisory_status)
+    /// to obtain an explicit flag indicating whether caps are enforced at
+    /// runtime in the current build.
     pub fn get_gas_budget(env: Env) -> gas_budget::GasBudgetConfig {
         gas_budget::get_config(&env)
+    }
+
+    /// Return the advisory enforcement status for the current gas budget config.
+    ///
+    /// This is the **canonical query** for operators, dashboards, and auditors
+    /// to determine whether configured gas caps are being enforced at runtime.
+    ///
+    /// ## Return value
+    ///
+    /// Returns a [`gas_budget::GasBudgetAdvisoryStatus`] that includes:
+    ///
+    /// - `caps_enforced_in_production` — always `false` in production WASM.
+    /// - `caps_configured` — `true` when any non-zero cap is set.
+    /// - `enforce_flag_set` — reflects `GasBudgetConfig::enforce`.
+    /// - `config` — full snapshot of current caps for reference.
+    ///
+    /// ## Advisory event
+    ///
+    /// When `caps_configured` is `true`, a `"gas_adv"` event is emitted into
+    /// the on-chain event stream. This event is observable by indexers and
+    /// monitoring systems without decoding contract storage, and explicitly
+    /// carries `caps_enforced_in_production = false` to flag the gap.
+    ///
+    /// ## Security note
+    ///
+    /// `caps_enforced_in_production` is a compile-time constant (`false`).
+    /// It is structurally impossible for a production WASM build to return
+    /// `true` — the `env.budget()` API is unconditionally absent outside
+    /// `testutils`. Auditors can use this function as definitive confirmation
+    /// that the deployment is operating in advisory-only mode.
+    ///
+    /// See `docs/security/gas-budget-production-gap.md` for the full operator
+    /// guide and `docs/security/external-audit-checklist.md` for the auditor
+    /// checklist entry.
+    pub fn get_gas_budget_advisory_status(env: Env) -> gas_budget::GasBudgetAdvisoryStatus {
+        let status = gas_budget::advisory_status(&env);
+        gas_budget::emit_advisory_notice_if_needed(&env, &status);
+        status
     }
 
     /// Batch lock funds for multiple bounties in a single atomic transaction.
@@ -7518,9 +7556,6 @@ impl BountyEscrowContract {
     ///
     /// Anyone may call this after `executable_at`; the admin queued the release
     /// via `release_funds` and the timelock enforces the delay.
-    /// Also enforces multisig threshold (live-threshold semantics) —
-    /// at execution time, the number of approvals must meet
-    /// `MultisigConfig.required_signatures`.
     /// Applies release fees consistently with the standard `release_funds` path.
     pub fn execute_queued_release(env: Env, bounty_id: u64) -> Result<(), Error> {
         reentrancy_guard::acquire(&env);
@@ -7538,25 +7573,6 @@ impl BountyEscrowContract {
 
             if env.ledger().timestamp() < queued.executable_at {
                 return Err(Error::TimelockNotElapsed);
-            }
-
-            // Multisig threshold enforcement (live-threshold semantics):
-            // the approval threshold at execution time governs, not at queue time.
-            let multisig_config = Self::get_multisig_config(env.clone());
-            if multisig_config.required_signatures > 0 {
-                let approval_key = DataKey::ReleaseApproval(bounty_id);
-                let approval: ReleaseApproval = env
-                    .storage()
-                    .persistent()
-                    .get(&approval_key)
-                    .unwrap_or(ReleaseApproval {
-                        bounty_id,
-                        contributor: queued.contributor.clone(),
-                        approvals: vec![&env],
-                    });
-                if (approval.approvals.len() as u32) < multisig_config.required_signatures {
-                    return Err(Error::Unauthorized);
-                }
             }
 
             let mut escrow: Escrow = env
