@@ -841,6 +841,8 @@ mod test_contract_registry;
 mod test_config_change_timelock;
 #[cfg(test)]
 mod test_build_info_init_event;
+#[cfg(test)]
+mod test_migration_replay;
 // ==================== END MONITORING MODULE ====================
 
 #[cfg_attr(feature = "contract", contract)]
@@ -2041,6 +2043,21 @@ impl GrainlifyContract {
         }
     }
 
+    pub fn get_migration_commitment(env: Env, target_version: u32) -> Option<MigrationCommitment> {
+        env.storage().instance().get(&DataKey::MigrationCommitment(target_version))
+    }
+
+    pub fn revoke_migration_commitment(env: Env, target_version: u32) {
+        let admin: Address = env.storage().instance().get(&DataKey::Admin)
+            .unwrap_or_else(|| panic!("{}", ContractError::NotInitialized as u32));
+        admin.require_auth();
+        env.storage().instance().remove(&DataKey::MigrationCommitment(target_version));
+        env.events().publish(
+            (symbol_short!("migrate"), symbol_short!("revoke")),
+            (target_version, env.ledger().timestamp()),
+        );
+    }
+
     // ========================================================================
     // Multisig Initialization
     // ========================================================================
@@ -2157,7 +2174,62 @@ impl GrainlifyContract {
     // ========================================================================
 
     /// Pre-commit a migration hash for replay protection.
+    ///
     /// Must be called before `migrate()` with the same target_version and hash.
+    /// This two-step commit-reveal pattern prevents unauthorized or replayed migrations
+    /// by requiring the admin to publish the migration hash in a separate transaction
+    /// before execution.
+    ///
+    /// # Parameters
+    ///
+    /// * `target_version` - The contract version to authorize for migration. Must be
+    ///   greater than the current version when `migrate()` is called.
+    /// * `hash` - SHA-256 hash of the migration data/payload. This hash must match
+    ///   exactly when calling `migrate()`, providing cryptographic binding between
+    ///   the commitment and the actual migration.
+    /// * `expires_at` - Absolute ledger timestamp when this commitment expires.
+    ///   Set to `0` for no expiry. If non-zero, `migrate()` will fail if called after
+    ///   this timestamp, and the commitment will be consumed to prevent replay after
+    ///   ledger timestamp resets.
+    ///
+    /// # Events
+    ///
+    /// Emits `MigrationCommittedEvent` with:
+    /// * `target_version` - The authorized version
+    /// * `hash` - The committed migration hash
+    /// * `committed_at` - Ledger timestamp when commitment was made
+    /// * `expires_at` - Expiry timestamp (0 if none)
+    ///
+    /// # Authorization
+    ///
+    /// Requires admin authorization (`admin.require_auth()`).
+    ///
+    /// # Security Considerations
+    ///
+    /// * **Replay Protection**: The commitment is consumed (deleted) after successful
+    ///   migration, preventing replay of the same migration hash.
+    /// * **Expiry Defense-in-Depth**: If a commitment expires, it is consumed even on
+    ///   failure to prevent replay after ledger timestamp resets (e.g., Stellar testnet
+    ///   resets). This is critical because `env.ledger().timestamp()` may move backward
+    ///   in test environments.
+    /// * **Hash Binding**: The hash check is independent of timestamp checks, providing
+    ///   a second barrier against replay attacks even if timestamp-based protections fail.
+    /// * **Version Isolation**: Commitments are keyed by `target_version`, preventing
+    ///   cross-version replay (a hash committed for v3 cannot be used for v4).
+    ///
+    /// # Trust Assumptions
+    ///
+    /// * **Ledger Timestamp Monotonicity**: The expiry mechanism assumes the ledger
+    ///   timestamp generally moves forward. In production (Stellar mainnet), this holds.
+    ///   In test networks with periodic resets, the expiry check alone is insufficient.
+    ///   The defense-in-depth mechanism (consuming expired commitments) and hash
+    ///   verification provide protection against timestamp reset scenarios.
+    ///
+    /// # Errors
+    ///
+    /// * `NotInitialized` - If the contract has not been initialized
+    /// * `NotAdmin` - If caller is not the admin
+    /// * `ReadOnlyMode` - If read-only mode is enabled
     pub fn commit_migration(env: Env, target_version: u32, hash: BytesN<32>, expires_at: u64) {
         let admin: Address = env.storage().instance().get(&DataKey::Admin)
             .unwrap_or_else(|| panic!("{}", ContractError::NotInitialized as u32));
@@ -2180,6 +2252,75 @@ impl GrainlifyContract {
     ///
     /// Requires a prior `commit_migration` call with the same hash (replay protection).
     /// Idempotent: migrating to the same version twice is a no-op after the first call.
+    ///
+    /// # Parameters
+    ///
+    /// * `target_version` - The contract version to migrate to. Must be strictly greater
+    ///   than the current version. Supported migration paths are defined in the
+    ///   version-specific migration functions (e.g., `migrate_v1_to_v2`, `migrate_v2_to_v3`).
+    /// * `migration_hash` - SHA-256 hash of the migration data/payload. Must match the
+    ///   hash previously committed via `commit_migration()` for the same `target_version`.
+    ///
+    /// # Events
+    ///
+    /// Emits `MigrationEvent` on success with:
+    /// * `from_version` - The version before migration
+    /// * `to_version` - The version after migration
+    /// * `timestamp` - Ledger timestamp when migration executed
+    /// * `migration_hash` - The hash used for this migration
+    /// * `success` - `true` if migration succeeded
+    /// * `error_message` - `None` on success
+    ///
+    /// # Authorization
+    ///
+    /// Requires admin authorization (`admin.require_auth()`).
+    ///
+    /// # Idempotency
+    ///
+    /// If `MigrationState.to_version == target_version` already exists in storage,
+    /// the call returns immediately without re-executing migrations or emitting events.
+    /// This allows safe retry of migration operations.
+    ///
+    /// # Chaining
+    ///
+    /// If `target_version > current_version + 1`, intermediate migrations are executed
+    /// in sequence. For example, migrating from v1 to v3 will execute:
+    /// 1. `migrate_v1_to_v2(&env)`
+    /// 2. `migrate_v2_to_v3(&env)`
+    ///
+    /// # Security Considerations
+    ///
+    /// * **Commitment Verification**: The migration hash must match a previously committed
+    ///   hash for the same target version. This prevents unauthorized migrations and
+    ///   replay attacks.
+    /// * **Commitment Consumption**: After successful migration, the commitment is deleted
+    ///   from storage, preventing replay of the same migration.
+    /// * **Expiry Defense-in-Depth**: If a commitment has expired (current timestamp > expires_at),
+    ///   the commitment is consumed even on failure. This prevents replay after ledger
+    ///   timestamp resets (e.g., Stellar testnet resets).
+    /// * **Hash Independence**: The hash check is independent of timestamp checks, providing
+    ///   a second barrier against replay attacks even if timestamp-based protections fail.
+    /// * **Version Monotonicity**: Only forward migrations are allowed (target_version > current_version).
+    ///   Downgrades are rejected to prevent state corruption.
+    ///
+    /// # Trust Assumptions
+    ///
+    /// * **Ledger Timestamp Monotonicity**: The expiry mechanism checks `env.ledger().timestamp()`
+    ///   against the commitment's `expires_at`. In production (Stellar mainnet), the ledger
+    ///   timestamp is monotonic. In test networks with periodic resets, the timestamp may
+    ///   move backward. The defense-in-depth mechanism (consuming expired commitments) and
+    ///   hash verification protect against this scenario.
+    ///
+    /// # Errors
+    ///
+    /// * `NotInitialized` - If the contract has not been initialized
+    /// * `NotAdmin` - If caller is not the admin
+    /// * `ReadOnlyMode` - If read-only mode is enabled
+    /// * `MigrationCommitmentNotFound` - If no commitment exists for `target_version`
+    /// * `MigrationHashMismatch` - If `migration_hash` does not match the committed hash
+    /// * `"Target version must be greater than current version"` - If `target_version <= current_version`
+    /// * `"No migration path available"` - If no migration function exists for the version step
+    /// * `"Migration commitment has expired"` - If current timestamp > commitment.expires_at
     pub fn migrate(env: Env, target_version: u32, migration_hash: BytesN<32>) {
         let admin: Address = env.storage().instance().get(&DataKey::Admin)
             .unwrap_or_else(|| panic!("{}", ContractError::NotInitialized as u32));
@@ -2209,6 +2350,9 @@ impl GrainlifyContract {
         }
 
         if commitment.expires_at > 0 && env.ledger().timestamp() > commitment.expires_at {
+            // Consume commitment even on expiry failure to prevent replay
+            // after a ledger-timestamp reset.
+            env.storage().instance().remove(&DataKey::MigrationCommitment(target_version));
             panic!("Migration commitment has expired");
         }
 

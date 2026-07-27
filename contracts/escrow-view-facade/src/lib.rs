@@ -234,6 +234,11 @@ impl EscrowViewFacade {
     /// the target program has no active delegate or the query fails for any
     /// reason, this function returns an empty vector to preserve the facade's
     /// read-only auditing semantics.
+    ///
+    /// **Atomicity Guarantee**: This query reads directly from the underlying
+    /// contract in the same transaction. If a delegate was revoked via
+    /// `emergency_revoke_delegate`, it will be instantly omitted from these
+    /// results, with no caching or stale-read window.
     pub fn query_all_delegates(
         env: Env,
         program_contract: Address,
