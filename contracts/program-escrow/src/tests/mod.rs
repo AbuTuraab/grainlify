@@ -26,3 +26,6 @@ mod chaos_batch_payout_tests;
 
 #[cfg(test)]
 mod cross_entrypoint_idempotency_tests;
+
+#[cfg(test)]
+mod delegate_revocation_propagation_tests;
